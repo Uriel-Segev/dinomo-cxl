@@ -202,6 +202,8 @@ void *ib_connection_manager_thread(void *arg)
 
         local_qp_info = (struct QPInfo *) calloc(config_info.threads_per_memory, sizeof(struct QPInfo));
         check(local_qp_info != NULL, "Failed to allocate local_qp_info");
+        union ibv_gid local_gid;
+        ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
         for (i = 0; i < config_info.threads_per_memory; i++) {
             local_qp_info[i].lid = ib_res.port_attr.lid;
             local_qp_info[i].qp_num = ib_res.qp[(peer_idx * config_info.threads_per_memory) + i]->qp_num;
@@ -213,8 +215,9 @@ void *ib_connection_manager_thread(void *arg)
             local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_partitioned_pool[(uint64_t)((peer_idx * config_info.threads_per_memory) + i)];
 #endif
             local_qp_info[i].rkey_buf = ib_res.mr_buf->rkey;
-            local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf + 
+            local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf +
                 ((uint64_t)((peer_idx * config_info.threads_per_memory) + i) * (uint64_t)config_info.msg_size);
+            memcpy(local_qp_info[i].gid, local_gid.raw, 16);
         }
 
         ret = sock_set_qp_info(peer_sockfd, local_qp_info, config_info.threads_per_memory);
@@ -223,7 +226,8 @@ void *ib_connection_manager_thread(void *arg)
         // change send QP state to RTS
         for (i = 0; i < config_info.threads_per_memory; i++) {
             ret = modify_qp_to_rts(ib_res.qp[(peer_idx * config_info.threads_per_memory) + i],
-                    remote_qp_info[i].qp_num, remote_qp_info[i].lid);
+                    remote_qp_info[i].qp_num, remote_qp_info[i].lid,
+                    (union ibv_gid *)remote_qp_info[i].gid);
             check(ret == 0, "Failed to modify qp[%d] to rts", (peer_idx * config_info.threads_per_memory) + i);
             LOG("\tqp[%" PRIu32 "] <-> qp[%" PRIu32 "]", ib_res.qp[(peer_idx * config_info.threads_per_memory) + i]->qp_num,
                     remote_qp_info[i].qp_num);
@@ -521,11 +525,13 @@ void *server_manager_thread(void *arg)
                 int client_rank, client_thread_id;
                 char *msg_ptr = (char *)wc[j].wr_id;
                 imm_data = ntohl(wc[j].imm_data);
+                fprintf(stderr, "[DBG storage] RECV arrived imm_data=0x%x IS_MERGE_ALL=%d\n", imm_data, (int)IS_MERGE_ALL(imm_data));
                 if (!IS_MERGE_ALL(imm_data)) {
                     // immediate data contains the information of the queue pair associated with sender
                     uint32_t raw_imm_data = INVALIDATE_TYPE_BITS(imm_data);
                     client_rank = GET_RANK(raw_imm_data);
                     client_thread_id = GET_CLIENT_THREAD_ID(raw_imm_data);
+                    fprintf(stderr, "[DBG storage] prealloc request from rank=%d thread=%d, allocating %d log blocks\n", client_rank, client_thread_id, MAX_PREALLOC_NUM);
 
                     uint64_t raq;
                     uint64_t *raddrs = (uint64_t *) msg_ptr;
@@ -556,6 +562,8 @@ void *server_manager_thread(void *arg)
                     post_send_poll(MAX_PREALLOC_NUM * sizeof(uint64_t), lkey, 0, qp[(client_rank * num_concurr_msgs) + client_thread_id], msg_ptr,
                             send_cq[(client_rank * num_concurr_msgs) + client_thread_id]);
 #endif
+                    fprintf(stderr, "[DBG storage] sent log block addrs to rank=%d thread=%d via qp[%d]\n",
+                            client_rank, client_thread_id, (client_rank * num_concurr_msgs) + client_thread_id);
                 } else {
                     // Invalidate the leftmost significant bit
                     uint32_t raw_imm_data = INVALIDATE_TYPE_BITS(imm_data);
@@ -1288,6 +1296,27 @@ int run_server(int threads_per_storage)
 
     reserved_alloc_queue = new tbb::concurrent_queue<uint64_t>;
     metadata_store = new libcuckoo::cuckoohash_map<std::string, void *>;
+
+    // Pre-allocate spare log blocks from the main thread where PMDK TLS is initialized.
+    // server_manager_thread does not have PMDK TLS set up, so calling pmemobj_zalloc
+    // from that thread crashes in pmemobj_errormsg (NULL TLS + offset 0x1808).
+    // By pre-populating reserved_alloc_queue here, server_manager_thread can always
+    // pop a block instead of calling pmemobj_zalloc directly.
+    {
+        const int spare_blocks = 32;
+        int n_ok = 0;
+        for (int b = 0; b < spare_blocks; b++) {
+            PMEMoid ret;
+            if (pmemobj_zalloc(pop, &ret, sizeof(log_block) + MAX_LOG_BLOCK_LEN, 0)) {
+                fprintf(stderr, "[storage] pmemobj_zalloc failed at spare block %d\n", b);
+                break;
+            }
+            reserved_alloc_queue->push((uint64_t)pmemobj_direct(ret));
+            n_ok++;
+        }
+        fprintf(stderr, "[storage] Pre-allocated %d spare log blocks (%lu MB each)\n",
+                n_ok, (sizeof(log_block) + MAX_LOG_BLOCK_LEN) / (1024*1024));
+    }
 
     barrier_init(&barrier, num_threads);
     tds = (thread_data_t *) malloc(num_threads * sizeof(thread_data_t));

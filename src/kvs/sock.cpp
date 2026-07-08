@@ -171,6 +171,11 @@ int sock_set_qp_info(int sock_fd, struct QPInfo *qp_info, int num_concurr_msgs)
         tmp_qp_info[i].raddr_pool = htonll(qp_info[i].raddr_pool);
         tmp_qp_info[i].rkey_buf = htonl(qp_info[i].rkey_buf);
         tmp_qp_info[i].raddr_buf = htonll(qp_info[i].raddr_buf);
+        /* ADDED: copy the 16-byte Global Identifier into the outgoing Queue Pair info
+         * struct. The Global Identifier is a raw byte array so it does not need byte-order
+         * conversion (unlike lid, qp_num, rkey etc. which are integers). The original
+         * code had no Global Identifier field in QPInfo and therefore did not copy it. */
+        memcpy(tmp_qp_info[i].gid, qp_info[i].gid, 16);
     }
 
     n = sock_write(sock_fd, (char *)&tmp_qp_info, sizeof(struct QPInfo) * num_concurr_msgs);
@@ -219,6 +224,11 @@ int sock_get_qp_info(int sock_fd, struct QPInfo *qp_info, int num_concurr_msgs)
         qp_info[i].raddr_pool = ntohll(tmp_qp_info[i].raddr_pool);
         qp_info[i].rkey_buf = ntohl(tmp_qp_info[i].rkey_buf);
         qp_info[i].raddr_buf = ntohll(tmp_qp_info[i].raddr_buf);
+        /* ADDED: copy the 16-byte Global Identifier from the received Queue Pair info
+         * struct into the caller's qp_info array. The Global Identifier is a raw byte
+         * array and needs no byte-order conversion. The original code had no Global
+         * Identifier field in QPInfo and therefore did not copy it. */
+        memcpy(qp_info[i].gid, tmp_qp_info[i].gid, 16);
     }
 
     return 0;

@@ -291,6 +291,19 @@ clht_t* clht_create(uint64_t num_buckets, int num_peers,
         clflush((char *)ht_ptr, sizeof(clht_hashtable_t), false, true);
         clflush((char *)w, sizeof(clht_t), false, true);
     } else {
+        /* ADDED: this else branch runs when the persistent memory pool already exists
+         * and is being reopened (not created fresh). The original code did not set
+         * remote_start_addr here, leaving it with a stale value from a previous run.
+         *
+         * remote_start_addr is used by the kvs node to compute RDMA write addresses:
+         *   target_address = (local_pointer - remote_start_addr) + rdma_pool_base
+         * If remote_start_addr holds the virtual address from a previous run but the
+         * pool is now mapped at a different address, this calculation produces a wrong
+         * target address and every RDMA write fails with a remote access error.
+         *
+         * The fix is to update remote_start_addr to the current virtual address of the
+         * pool (pop) every time the pool is opened, whether fresh or reopened. */
+        w->remote_start_addr = (uint64_t)pop;
         w->resize_lock = LOCK_FREE;
         w->gc_lock = LOCK_FREE;
         w->status_lock = LOCK_FREE;
@@ -373,6 +386,22 @@ clht_t** clht_create(uint64_t num_buckets, int num_peers,
             clflush((char *)ht_ptr, sizeof(clht_hashtable_t), false, true);
             clflush((char *)w[i], sizeof(clht_t), false, true);
         } else {
+            /* ADDED: this else branch runs when the persistent memory pool already exists
+             * and is being reopened (not created fresh). The original code did not set
+             * remote_start_addr here, leaving it with a stale value from a previous run.
+             *
+             * remote_start_addr is used by the kvs node to compute RDMA write addresses:
+             *   target_address = (local_pointer - remote_start_addr) + rdma_pool_base
+             * If remote_start_addr holds the virtual address from a previous run but the
+             * pool is now mapped at a different address, this calculation produces a wrong
+             * target address and every RDMA write fails with a remote access error
+             * (IBV_WC_REM_ACCESS_ERR).
+             *
+             * The fix is to update remote_start_addr to the current virtual address of the
+             * pool (pop) every time the pool is opened, whether fresh or reopened.
+             * This is the SHARED_NOTHING variant of the same fix applied above in the
+             * single-hash-table code path — w[i] is the per-peer hash table wrapper. */
+            w[i]->remote_start_addr = (uint64_t)pop;
             w[i]->resize_lock = LOCK_FREE;
             w[i]->gc_lock = LOCK_FREE;
             w[i]->status_lock = LOCK_FREE;

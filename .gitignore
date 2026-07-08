@@ -4,3 +4,10 @@ cscope.out
 tags
 
 common/scripts/protobuf*
+
+
+
+# Unused hardware configs
+vm-configs/c6220/
+vm-configs/d6515/
+vm-configs/r6525/

@@ -118,10 +118,24 @@ void user_request_handler(
                     global_hash_rings, local_hash_rings, key_replication_map, pushers,
                     kSelfTierIdVector, succeed, seed);
 
+            /* ADDED: print the result of get_responsible_threads() — the function that determines
+             * which kvs thread is responsible for this key based on the consistent hash ring.
+             * The original code had no diagnostic print here. succeed=0 means the routing table
+             * is not yet populated (the kvs has not finished joining the cluster); threads.size=0
+             * means no thread claimed responsibility for this key. Both indicate startup issues. */
+            fprintf(stderr, "[DBG urh] key=%s get_responsible_threads succeed=%d threads.size=%zu\n",
+                    key.c_str(), (int)succeed, threads.size());
+
             if (succeed)
             {
 #ifdef ENABLE_DINOMO_KVS // Sekwon
-                if (std::find(threads.begin(), threads.end(), wt) == threads.end())
+                bool wt_in_threads = (std::find(threads.begin(), threads.end(), wt) != threads.end());
+                /* ADDED: print whether this worker thread is in the responsible thread list for
+                 * this key. The original code had no diagnostic print here. wt_in_threads=0 means
+                 * this thread is not responsible for the key and will forward the request to
+                 * the correct thread instead of processing it locally. */
+                fprintf(stderr, "[DBG urh] key=%s wt_in_threads=%d\n", key.c_str(), (int)wt_in_threads);
+                if (!wt_in_threads)
                 {
 #ifndef SHARED_NOTHING
                     // if we don't know what threads are responsible, we issue a rep
@@ -197,7 +211,15 @@ void user_request_handler(
                         }
                         else
                         {
+                            /* ADDED: print before calling process_put() to confirm this thread is
+                             * about to write the key into the DINOMO kvs. The original code had
+                             * no diagnostic print here. */
+                            fprintf(stderr, "[DBG urh] key=%s calling process_put\n", key.c_str());
                             unsigned ret = process_put(key, tuple.lattice_type(), payload, serializers[tuple.lattice_type()]);
+                            /* ADDED: print the return value of process_put() and whether batching
+                             * is enabled. The original code had no diagnostic print here. A non-zero
+                             * return value indicates an error writing to the log block. */
+                            fprintf(stderr, "[DBG urh] key=%s process_put returned %u batching=%d\n", key.c_str(), ret, (int)batching);
                             if (batching) {
                                 key_access_tracker[key].insert(std::chrono::system_clock::now());
                                 access_count += 1;

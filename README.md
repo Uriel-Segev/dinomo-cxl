@@ -1,3 +1,30 @@
+## Changes from Original (This Fork)
+
+This fork ports DINOMO to run on a single CloudLab host using 5 KVM virtual machines connected over Soft-RoCE (software RDMA over a virtual Linux bridge), removing the Kubernetes/Docker requirement entirely.
+
+### What was changed
+
+**Soft-RoCE support** — The original code routes RDMA packets using a Local Identifier (LID), which only works on physical InfiniBand. Soft-RoCE runs over Ethernet and requires a Global Identifier (GID) and a Global Routing Header (GRH) on every packet. Changes made:
+- `include/kvs/ib.h`: lowered MTU from 4096 to 1024 (virtual bridge limit); added `gid[16]` field to `QPInfo` struct; added `remote_gid` parameter to `modify_qp_to_rts()`
+- `src/kvs/ib.cpp`: updated `modify_qp_to_rts()` to set `is_global=1`, configure GRH with destination GID and `sgid_index=1`
+- `src/kvs/setup_ib.cpp`: added `ibv_query_gid()` call in both `connect_qp_server()` and `connect_qp_client()`; GID exchanged over TCP during Queue Pair handshake
+- `src/kvs/sock.cpp`: added GID serialization in `sock_set_qp_info()` and `sock_get_qp_info()`
+- `src/kvs/dinomo_storage.cpp`: same GID changes applied to `ib_connection_manager_thread()`
+
+**Stale `remote_start_addr` fix** — On storage restart, the PMDK pool may map at a new virtual address. The original code did not update `remote_start_addr` in the pool-reopen path, causing every RDMA write to fail with `IBV_WC_REM_ACCESS_ERR`. Fixed in `src/kvs/Indexes/P-CLHT/src/clht_lb_res.c`.
+
+**PMDK TLS crash fix** — `server_manager_thread` called `pmemobj_zalloc()` on demand, but PMDK 1.8 thread-local storage is not initialized in that thread, causing a crash ~40 seconds into a benchmark run. Fixed in `src/kvs/dinomo_storage.cpp` by pre-allocating spare log blocks from the main thread before any worker threads start.
+
+**Diagnostic prints** — `fprintf` prints added to `server.cpp`, `dinomo_compute.hpp`, and `user_request_handler.cpp` to make the startup sequence and RDMA handshake observable. All marked with `ADDED` comments.
+
+### Running on CloudLab
+
+See `vm-configs/c6525-25g/README.md` for full setup instructions. Tested on a c6525-25g node (AMD EPYC) on Utah CloudLab.
+
+For a full description of every change with before/after code, see `CODE_CHANGES.md`.
+
+---
+
 ## DINOMO: An Elastic, Scalable, High-Performance Key-Value Store for Disaggregated Persistent Memory (VLDB 2023, PVLDB 2022 Vol. 15 No. 13)
 Dinomo is a novel key-value store for disaggregated persistent memory (DPM). 
 Dinomo is the first key-value store for DPM that simultaneously achieves 

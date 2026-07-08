@@ -1,3 +1,9 @@
+/* ADDED: include execinfo.h to get access to backtrace() and backtrace_symbols().
+ * The original file did not include this header. It is needed by the terminate handler
+ * in main() and by the STEP debug prints — if the process crashes or throws an uncaught
+ * exception, backtrace() walks the call stack so the crash site can be identified
+ * without running a debugger. */
+#include <execinfo.h>
 #include "kvs/kvs_handlers.hpp"
 #include "yaml-cpp/yaml.h"
 
@@ -64,10 +70,17 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
          Address seed_ip, vector<Address> routing_ips,
          vector<Address> monitoring_ips, Address management_ip)
 {
+    /* ADDED: STEP1 progress marker — print to stderr immediately on entry so that if the
+     * kvs process hangs or crashes before spdlog is set up, there is still evidence in the
+     * log that this thread started. The original code had no such diagnostic prints. */
+    fprintf(stderr, "run<T>[tid=%u] STEP1: entered\n", thread_id);
     string log_file = "log_" + std::to_string(thread_id) + ".txt";
     string log_name = "server_log_" + std::to_string(thread_id);
     auto log = spdlog::basic_logger_mt(log_name, log_file, true);
     log->flush_on(spdlog::level::info);
+    /* ADDED: STEP2 progress marker — confirms spdlog logger was created without crashing.
+     * The original code had no such diagnostic print. */
+    fprintf(stderr, "run<T>[tid=%u] STEP2: spdlog created\n", thread_id);
 
     // each thread has a handle to itself
     ServerThread wt = ServerThread(public_ip, private_ip, thread_id);
@@ -150,8 +163,18 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
     addr_requester.connect(RoutingThread(seed_ip, 0).seed_connect_address());
     kZmqUtil->send_string("join", &addr_requester);
 
+    /* ADDED: STEP3 progress marker — printed just before the blocking recv_string() call
+     * that waits for the routing node to respond. If the kvs log shows STEP3 but not STEP4,
+     * the routing node is unreachable or has not started yet. The original code had no such
+     * diagnostic print. */
+    fprintf(stderr, "run<T>[tid=%u] STEP3: waiting for routing response\n", thread_id);
     // receive and add all the addresses that seed node sent
     string serialized_addresses = kZmqUtil->recv_string(&addr_requester);
+    /* ADDED: STEP4 progress marker — printed after the routing response is received. Also
+     * prints the length of the serialized response so an empty or truncated reply can be
+     * detected. All four worker threads printing STEP4 confirms the kvs is fully initialized
+     * and ready to process requests. The original code had no such diagnostic print. */
+    fprintf(stderr, "run<T>[tid=%u] STEP4: got routing response len=%zu\n", thread_id, serialized_addresses.size());
     ClusterMembership membership;
     membership.ParseFromString(serialized_addresses);
 
@@ -201,7 +224,6 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
         }
     }
 
-#if 0
 #ifdef ENABLE_DINOMO_KVS
     if (thread_id == 0)
     {
@@ -323,7 +345,6 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
                 msg, &pushers[MonitoringThread(address).notify_connect_address()]);
         }
     }
-#endif
 #endif
 
     ////////////////// Sekwon: These serializer should be changed or removed for DINOMO
@@ -1270,6 +1291,23 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
 
 int main(int argc, char *argv[])
 {
+    /* ADDED: install a terminate handler that prints a backtrace before aborting. The
+     * original code had no terminate handler. In C++, std::terminate() is called when an
+     * exception propagates out of main() or a thread function without being caught (for
+     * example std::bad_alloc from a failed memory allocation). Without this handler the
+     * process exits silently with no information about where the failure happened.
+     * backtrace() and backtrace_symbols() (from execinfo.h added at the top of this file)
+     * walk the call stack and convert frame pointers to human-readable function names so
+     * the crash site can be identified in the log without a debugger. */
+    std::set_terminate([]() {
+        void *bt[30]; int bts = backtrace(bt, 30);
+        char **btsyms = backtrace_symbols(bt, bts);
+        fprintf(stderr, "TERMINATE HANDLER (bad_alloc or uncaught exception):\n");
+        for (int i = 0; i < bts; i++) fprintf(stderr, "  bt[%d]: %s\n", i, btsyms[i]);
+        free(btsyms);
+        abort();
+    });
+
     if (argc != 1)
     {
         std::cerr << "Usage: " << argv[0] << std::endl;

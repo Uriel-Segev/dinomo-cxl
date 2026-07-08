@@ -63,9 +63,24 @@ public:
 
         h = (clht_t *) malloc(sizeof(clht_t));
         post_read_signaled_blocking_profile(sizeof(clht_t), ib_res.mr_buf->lkey, 0, ib_res.qp[thread_id],
-        ib_res.ib_buf + (config_info.msg_size * thread_id), ib_res.raddr_pool[thread_id], 
+        ib_res.ib_buf + (config_info.msg_size * thread_id), ib_res.raddr_pool[thread_id],
         ib_res.rkey_pool[thread_id], ib_res.cq[thread_id], &rdma_read_counter, &rdma_read_payload);
         memcpy(h, ib_res.ib_buf + (config_info.msg_size * thread_id), sizeof(clht_t));
+        /* ADDED: print the critical RDMA addressing values after reading the hash table header
+         * from storage via RDMA. The original code had no such diagnostic print.
+         *
+         * raddr_pool is the remote address (on the storage node) of the start of the PMDK
+         * pool — this is what the Queue Pair handshake gave us as raddr_pool.
+         * rkey_pool is the remote memory key that authorizes RDMA reads/writes into the pool.
+         * remote_start_addr is read out of the clht_t header we just fetched — it must match
+         * raddr_pool. If they differ it means remote_start_addr was stale (the pool was
+         * reopened at a different virtual address) and all RDMA writes will fail.
+         * log_table_addr is the pool offset of the log-block address table.
+         * mapping_raddr is the remote address of this thread's log-block mapping slot. */
+        fprintf(stderr, "DINOMO[tid=%d]: raddr_pool=0x%lx rkey_pool=0x%x remote_start_addr=0x%lx log_table_addr=0x%lx mapping_raddr=0x%lx\n",
+                thread_id, (unsigned long)ib_res.raddr_pool[thread_id], ib_res.rkey_pool[thread_id],
+                (unsigned long)h->remote_start_addr, (unsigned long)h->log_table_addr,
+                (unsigned long)mapping_table_raddr(config_info.rank));
 
         memset((char *)(ib_res.ib_buf + (config_info.msg_size * thread_id)), 0, config_info.msg_size);
         post_write_signaled_blocking_profile(sizeof(uint64_t), ib_res.mr_buf->lkey, 0, ib_res.qp[thread_id],
@@ -542,9 +557,18 @@ void Dinomo<T>::preallocate_log_blocks(uint32_t lkey_buf, struct ibv_qp *qp, cha
     int ret = 0, n = 0;
     bool stop = false;
 
-    ret = post_send_imm_profile(0, lkey_buf, (uint64_t)buf_ptr, SET_IMM(config_info.rank, thread_id), 
+    /* ADDED: print before posting the SEND to storage that requests more log blocks.
+     * The original code had no diagnostic prints in preallocate_log_blocks(). If the
+     * kvs hangs waiting for storage to respond, this print confirms the SEND was attempted
+     * and shows which rank/thread sent it. */
+    fprintf(stderr, "[DBG prealloc] thread=%ld posting SEND to storage (rank=%d)\n", thread_id, config_info.rank);
+    ret = post_send_imm_profile(0, lkey_buf, (uint64_t)buf_ptr, SET_IMM(config_info.rank, thread_id),
             qp, buf_ptr, &rdma_send_counter, &rdma_send_payload);
     check(ret == 0, "Thread[%ld]: failed to post send", thread_id);
+    /* ADDED: print after the SEND is posted, just before the blocking poll loop that waits
+     * for storage to respond with new log block addresses. The original code had no such
+     * diagnostic print. */
+    fprintf(stderr, "[DBG prealloc] thread=%ld SEND posted, polling for RECV...\n", thread_id);
 
     while (stop != true)
     {
@@ -554,6 +578,10 @@ void Dinomo<T>::preallocate_log_blocks(uint32_t lkey_buf, struct ibv_qp *qp, cha
 
         for (uint64_t j = 0; j < n; j++)
         {
+            /* ADDED: print each work completion entry during the poll loop. The original code
+             * had no diagnostic print here. Printing the opcode and status shows whether each
+             * completion is a SEND or RECV and whether it succeeded or failed with an error. */
+            fprintf(stderr, "[DBG prealloc] thread=%ld poll wc[%lu] opcode=%d status=%d\n", thread_id, j, (int)wc[j].opcode, (int)wc[j].status);
             if (wc[j].status != IBV_WC_SUCCESS)
             {
                 if (wc[j].opcode == IBV_WC_SEND)
@@ -570,6 +598,11 @@ void Dinomo<T>::preallocate_log_blocks(uint32_t lkey_buf, struct ibv_qp *qp, cha
 
             if (wc[j].opcode == IBV_WC_RECV)
             {
+                /* ADDED: print when the RECV completion arrives from storage. The original code
+                 * had no diagnostic print here. This confirms the round-trip SEND→storage→RECV
+                 * succeeded and new log block addresses are about to be copied from the receive
+                 * buffer into log_blocks_raddrs. */
+                fprintf(stderr, "[DBG prealloc] thread=%ld got RECV from storage, copying log block addrs\n", thread_id);
                 ret = post_recv_profile((uint32_t)config_info.msg_size, lkey_buf, wc[j].wr_id, qp, (char *)wc[j].wr_id,
                         &rdma_recv_counter, &rdma_recv_payload);
                 check(ret == 0, "Thread[%ld]: failed to post recv", thread_id);
@@ -848,10 +881,22 @@ retry:
             }
         }
     } else {
+        /* ADDED: print before calling preallocate_log_blocks() when the non-replicated log
+         * block address is zero (no current block is allocated for this thread). The original
+         * code had no diagnostic print here. This is the path that triggers a new log block
+         * allocation from storage — the print shows which thread and key caused it. */
+        fprintf(stderr, "[DBG put] thread=%ld key=%lu non_replicated_alloc=0, calling preallocate_log_blocks\n", thread_id, key);
         preallocate_log_blocks(lkey_buf, qp, buf_ptr, cq, wc, num_wc);
+        /* ADDED: print after preallocate_log_blocks() returns to confirm the blocking SEND/RECV
+         * round-trip to storage completed. The original code had no diagnostic print here. */
+        fprintf(stderr, "[DBG put] thread=%ld key=%lu preallocate_log_blocks returned\n", thread_id, key);
 
         next_batch = pop_log_blocks_raddr();
         non_replicated_alloc = next_batch;
+        /* ADDED: print the remote address of the newly allocated log block. next_batch is the
+         * RDMA address in the storage pool where this thread will write its log entries.
+         * The original code had no diagnostic print here. */
+        fprintf(stderr, "[DBG put] thread=%ld key=%lu next_batch=0x%lx\n", thread_id, key, next_batch);
 
         // Allocate new local log block
         new_local_log_block = (log_block *) calloc(1, sizeof(log_block) + MAX_LOG_BLOCK_LEN);
@@ -1334,10 +1379,22 @@ retry:
             }
         }
     } else {
+        /* ADDED: print before calling preallocate_log_blocks() when the non-replicated log
+         * block address is zero (no current block is allocated for this thread). The original
+         * code had no diagnostic print here. This is the path that triggers a new log block
+         * allocation from storage — the print shows which thread and key caused it. */
+        fprintf(stderr, "[DBG put] thread=%ld key=%lu non_replicated_alloc=0, calling preallocate_log_blocks\n", thread_id, key);
         preallocate_log_blocks(lkey_buf, qp, buf_ptr, cq, wc, num_wc);
+        /* ADDED: print after preallocate_log_blocks() returns to confirm the blocking SEND/RECV
+         * round-trip to storage completed. The original code had no diagnostic print here. */
+        fprintf(stderr, "[DBG put] thread=%ld key=%lu preallocate_log_blocks returned\n", thread_id, key);
 
         next_batch = pop_log_blocks_raddr();
         non_replicated_alloc = next_batch;
+        /* ADDED: print the remote address of the newly allocated log block. next_batch is the
+         * RDMA address in the storage pool where this thread will write its log entries.
+         * The original code had no diagnostic print here. */
+        fprintf(stderr, "[DBG put] thread=%ld key=%lu next_batch=0x%lx\n", thread_id, key, next_batch);
 
         // Allocate new local log block
         new_local_log_block = (log_block *) calloc(1, sizeof(log_block) + MAX_LOG_BLOCK_LEN);

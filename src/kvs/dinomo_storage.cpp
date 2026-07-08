@@ -202,6 +202,12 @@ void *ib_connection_manager_thread(void *arg)
 
         local_qp_info = (struct QPInfo *) calloc(config_info.threads_per_memory, sizeof(struct QPInfo));
         check(local_qp_info != NULL, "Failed to allocate local_qp_info");
+        /* ADDED: query this device's Global Identifier so it can be sent to the kvs node
+         * during the Queue Pair handshake. The original code had no Global Identifier
+         * field in QPInfo and never called ibv_query_gid(). RoCE and Soft-RoCE require
+         * each side to know the other's Global Identifier to build the Global Routing
+         * Header on every packet — without it all RDMA packets are silently dropped.
+         * Index 1 selects the RoCEv2 Global Identifier entry for this port. */
         union ibv_gid local_gid;
         ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
         for (i = 0; i < config_info.threads_per_memory; i++) {
@@ -217,6 +223,10 @@ void *ib_connection_manager_thread(void *arg)
             local_qp_info[i].rkey_buf = ib_res.mr_buf->rkey;
             local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf +
                 ((uint64_t)((peer_idx * config_info.threads_per_memory) + i) * (uint64_t)config_info.msg_size);
+            /* ADDED: copy this storage node's 16-byte Global Identifier into the outgoing
+             * Queue Pair info struct so the kvs node receives it and can configure global
+             * routing toward this storage node. The original code had no Global Identifier
+             * field here. The raw byte array needs no byte-order conversion. */
             memcpy(local_qp_info[i].gid, local_gid.raw, 16);
         }
 
@@ -225,6 +235,13 @@ void *ib_connection_manager_thread(void *arg)
 
         // change send QP state to RTS
         for (i = 0; i < config_info.threads_per_memory; i++) {
+            /* CHANGED: added the fourth argument (union ibv_gid *)remote_qp_info[i].gid.
+             * The original call was:
+             *   modify_qp_to_rts(qp, remote_qp_info[i].qp_num, remote_qp_info[i].lid)
+             * The updated modify_qp_to_rts() now requires the remote Global Identifier so
+             * it can configure the Queue Pair's address handle with global routing (required
+             * for RoCE and Soft-RoCE). The remote Global Identifier was received from the
+             * kvs node in the sock_get_qp_info() call above and stored in remote_qp_info. */
             ret = modify_qp_to_rts(ib_res.qp[(peer_idx * config_info.threads_per_memory) + i],
                     remote_qp_info[i].qp_num, remote_qp_info[i].lid,
                     (union ibv_gid *)remote_qp_info[i].gid);
@@ -1297,23 +1314,37 @@ int run_server(int threads_per_storage)
     reserved_alloc_queue = new tbb::concurrent_queue<uint64_t>;
     metadata_store = new libcuckoo::cuckoohash_map<std::string, void *>;
 
-    // Pre-allocate spare log blocks from the main thread where PMDK TLS is initialized.
-    // server_manager_thread does not have PMDK TLS set up, so calling pmemobj_zalloc
-    // from that thread crashes in pmemobj_errormsg (NULL TLS + offset 0x1808).
-    // By pre-populating reserved_alloc_queue here, server_manager_thread can always
-    // pop a block instead of calling pmemobj_zalloc directly.
+    /* ADDED: pre-allocate spare log blocks here in run_server() (the main thread) before
+     * any worker threads are spawned. The original code allocated log blocks on demand
+     * inside server_manager_thread via pmemobj_zalloc(). This caused a crash approximately
+     * 40 seconds into a benchmark run when the pre-allocated supply from the pool's initial
+     * state ran out and server_manager_thread called pmemobj_zalloc() for the first time.
+     *
+     * The crash happens because PMDK version 1.8 stores per-thread state in thread-local
+     * storage (TLS). pmemobj_zalloc() internally calls pmemobj_errormsg() which reads from
+     * TLS. server_manager_thread never initializes PMDK TLS (only the main thread and
+     * threads that call pmemobj_open/create do). When pmemobj_errormsg() runs in
+     * server_manager_thread with uninitialized TLS the result is a NULL pointer dereference
+     * at a fixed offset (0x1808), which crashes the storage process.
+     *
+     * The fix is to call pmemobj_zalloc() here in the main thread (where PMDK TLS is
+     * initialized) to fill reserved_alloc_queue with 32 spare log blocks before any
+     * worker thread starts. server_manager_thread then calls try_pop() on the queue instead
+     * of calling pmemobj_zalloc() directly, so it never touches PMDK TLS. */
     {
         const int spare_blocks = 32;
         int n_ok = 0;
         for (int b = 0; b < spare_blocks; b++) {
             PMEMoid ret;
             if (pmemobj_zalloc(pop, &ret, sizeof(log_block) + MAX_LOG_BLOCK_LEN, 0)) {
+                /* allocation failed — print which block number failed and stop early */
                 fprintf(stderr, "[storage] pmemobj_zalloc failed at spare block %d\n", b);
                 break;
             }
             reserved_alloc_queue->push((uint64_t)pmemobj_direct(ret));
             n_ok++;
         }
+        /* print how many spare blocks were successfully pre-allocated and their size */
         fprintf(stderr, "[storage] Pre-allocated %d spare log blocks (%lu MB each)\n",
                 n_ok, (sizeof(log_block) + MAX_LOG_BLOCK_LEN) / (1024*1024));
     }

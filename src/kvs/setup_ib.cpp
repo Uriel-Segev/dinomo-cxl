@@ -55,18 +55,42 @@ int connect_qp_server()
     local_qp_info = (struct QPInfo *) calloc(ib_res.num_qps, sizeof(struct QPInfo));
     check(local_qp_info != NULL, "Failed to allocate local_qp_info");
 
-    for (i = 0; i < ib_res.num_qps; i++) {
-        local_qp_info[i].lid = ib_res.port_attr.lid;
-        local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;
-        local_qp_info[i].rank = config_info.rank;
-        local_qp_info[i].rkey_pool = ib_res.mr_pool->rkey;
+    {
+        /* ADDED: query the local Global Identifier at index 1 from the RDMA device.
+         * Index 1 on a Soft-RoCE device is the IPv4-mapped Global Identifier
+         * (e.g. ::ffff:10.0.0.1), which is needed for routing over the virtual bridge.
+         * The original code did not query or exchange Global Identifiers at all. */
+        union ibv_gid local_gid;
+        memset(&local_gid, 0, sizeof(local_gid));
+        /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
+         * index 1. gid_ret is checked in the debug print below; 0 means success. */
+        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+        /* ADDED: debug print showing the storage node's own Global Identifier so we can
+         * verify during startup that the correct address is being advertised to kvs. */
+        fprintf(stderr, "SERVER connect_qp_server: num_qps=%d gid_ret=%d gid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                ib_res.num_qps, gid_ret,
+                local_gid.raw[0], local_gid.raw[1], local_gid.raw[2], local_gid.raw[3],
+                local_gid.raw[4], local_gid.raw[5], local_gid.raw[6], local_gid.raw[7],
+                local_gid.raw[8], local_gid.raw[9], local_gid.raw[10], local_gid.raw[11],
+                local_gid.raw[12], local_gid.raw[13], local_gid.raw[14], local_gid.raw[15]);
+        for (i = 0; i < ib_res.num_qps; i++) {
+            local_qp_info[i].lid = ib_res.port_attr.lid;
+            local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;
+            local_qp_info[i].rank = config_info.rank;
+            local_qp_info[i].rkey_pool = ib_res.mr_pool->rkey;
 #ifndef SHARED_NOTHING
-        local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_pool;
+            local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_pool;
 #else
-        local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_partitioned_pool[i];
+            local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_partitioned_pool[i];
 #endif
-        local_qp_info[i].rkey_buf = ib_res.mr_buf->rkey;
-        local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf + (i * config_info.msg_size);
+            local_qp_info[i].rkey_buf = ib_res.mr_buf->rkey;
+            local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf + (i * config_info.msg_size);
+            /* ADDED: copy the 16-byte Global Identifier into the Queue Pair info struct
+             * so it gets sent to the kvs node over TCP during the handshake. The kvs
+             * node will use this Global Identifier to configure its outgoing RDMA packets
+             * so they are routed correctly to this storage node. */
+            memcpy(local_qp_info[i].gid, local_gid.raw, 16);
+        }
     }
 
     // get qp_info from client
@@ -93,8 +117,13 @@ int connect_qp_server()
     LOG(LOG_SUB_HEADER, "Start of IB Config");
     for (i = 0; i < num_peers; i++) {
         for (j = 0; j < num_concurr_msgs; j++) {
+            /* CHANGED: original call was modify_qp_to_rts(..., qp_num, lid) with no
+             * Global Identifier. Now passes the remote Global Identifier received from
+             * the kvs node so the Queue Pair transition to Ready-To-Send state configures
+             * global routing — required for RDMA over Converged Ethernet and Soft-RoCE. */
             ret = modify_qp_to_rts(ib_res.qp[(remote_qp_info[i * num_concurr_msgs].rank * num_concurr_msgs) + j],
-                    remote_qp_info[(i * num_concurr_msgs) + j].qp_num, remote_qp_info[(i * num_concurr_msgs) + j].lid);
+                    remote_qp_info[(i * num_concurr_msgs) + j].qp_num, remote_qp_info[(i * num_concurr_msgs) + j].lid,
+                    (union ibv_gid *)remote_qp_info[(i * num_concurr_msgs) + j].gid);
             check(ret == 0, "Failed to modify qp[%d] to rts", (remote_qp_info[i * num_concurr_msgs].rank * num_concurr_msgs) + j);
             LOG("\tqp[%" PRIu32 "] <-> qp[%" PRIu32 "]", ib_res.qp[(remote_qp_info[i * num_concurr_msgs].rank * num_concurr_msgs) + j]->qp_num,
                     remote_qp_info[(i * num_concurr_msgs) + j].qp_num);
@@ -161,14 +190,29 @@ int connect_qp_client()
     local_qp_info = (struct QPInfo *) calloc(ib_res.num_qps, sizeof(struct QPInfo));
     check(local_qp_info != NULL, "Failed to allocate local_qp_info");
 
-    for (i = 0; i < ib_res.num_qps; i++) {
-        local_qp_info[i].lid = ib_res.port_attr.lid;
-        local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;
-        local_qp_info[i].rank = config_info.rank;
-        local_qp_info[i].rkey_pool = ib_res.mr_pool->rkey;
-        local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_pool;
-        local_qp_info[i].rkey_buf = ib_res.mr_buf->rkey;
-        local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf + (i * config_info.msg_size);
+    {
+        /* ADDED: query the local Global Identifier at index 1 from the RDMA device.
+         * Index 1 on a Soft-RoCE device is the IPv4-mapped Global Identifier
+         * (e.g. ::ffff:10.0.0.2), which is needed for routing over the virtual bridge.
+         * The original code did not query or exchange Global Identifiers at all. */
+        union ibv_gid local_gid;
+        /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
+         * index 1 of this kvs node's RDMA device. */
+        ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+        for (i = 0; i < ib_res.num_qps; i++) {
+            local_qp_info[i].lid = ib_res.port_attr.lid;
+            local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;
+            local_qp_info[i].rank = config_info.rank;
+            local_qp_info[i].rkey_pool = ib_res.mr_pool->rkey;
+            local_qp_info[i].raddr_pool = (uintptr_t) ib_res.ib_pool;
+            local_qp_info[i].rkey_buf = ib_res.mr_buf->rkey;
+            local_qp_info[i].raddr_buf = (uintptr_t) ib_res.ib_buf + (i * config_info.msg_size);
+            /* ADDED: copy the 16-byte Global Identifier into the Queue Pair info struct
+             * so it gets sent to the storage node over TCP during the handshake. Storage
+             * will use this Global Identifier to configure its outgoing RDMA packets so
+             * they are routed correctly back to this kvs node. */
+            memcpy(local_qp_info[i].gid, local_gid.raw, 16);
+        }
     }
 
     // send qp_info to server
@@ -205,9 +249,15 @@ int connect_qp_client()
         }
 
         for (j = 0; j < num_concurr_msgs; j++) {
-            ret = modify_qp_to_rts(ib_res.qp[(i * num_concurr_msgs) + j], 
+            /* CHANGED: original call was modify_qp_to_rts(..., qp_num, lid) with no
+             * Global Identifier. Now passes the remote Global Identifier received from
+             * the storage node so the Queue Pair transition to Ready-To-Send state
+             * configures global routing — required for RDMA over Converged Ethernet
+             * and Soft-RoCE. */
+            ret = modify_qp_to_rts(ib_res.qp[(i * num_concurr_msgs) + j],
                     remote_qp_info[peer_sock_idx + j].qp_num,
-                    remote_qp_info[peer_sock_idx + j].lid);
+                    remote_qp_info[peer_sock_idx + j].lid,
+                    (union ibv_gid *)remote_qp_info[peer_sock_idx + j].gid);
             check(ret == 0, "Failed to modify qp[%d] to rts", (i * num_concurr_msgs) + j);
             LOG("\tqp[%" PRIu32 "] <-> qp[%" PRIu32 "]", ib_res.qp[(i * num_concurr_msgs) + j]->qp_num,
                     remote_qp_info[peer_sock_idx + j].qp_num);
@@ -320,6 +370,15 @@ int setup_ib()
         ib_res.mr_pool = ibv_reg_mr(ib_res.pd, (void *)ib_res.ib_pool, ib_res.ib_pool_size,
                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
         check(ib_res.mr_pool != NULL, "Failed to register PM pool");
+        /* ADDED: debug print showing the persistent memory pool's base address, size,
+         * end address, and remote key after registration. This was critical during
+         * debugging — compared this base address against the remote_start_addr field
+         * in the hash table (printed in dinomo_compute.hpp) to verify the fix in
+         * clht_lb_res.c was working correctly. */
+        fprintf(stderr, "SERVER mr_pool: base=0x%lx size=%zu end=0x%lx rkey=0x%x\n",
+                (uint64_t)ib_res.ib_pool, ib_res.ib_pool_size,
+                (uint64_t)ib_res.ib_pool + ib_res.ib_pool_size,
+                ib_res.mr_pool->rkey);
 
         ib_res.mr_buf = ibv_reg_mr(ib_res.pd, (void *)ib_res.ib_buf, ib_res.ib_buf_size,
                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);

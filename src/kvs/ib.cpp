@@ -80,17 +80,17 @@ int modify_qp_to_rts(struct ibv_qp *qp, uint32_t target_qp_num, uint16_t target_
         /* ADDED: destination Global Identifier — the remote side's address on the
          * RDMA network, equivalent to an IP address for InfiniBand/RoCE routing. */
         qp_attr.ah_attr.grh.dgid       = *remote_gid;
-        /* ADDED: source Global Identifier index. Index 1 on a Soft-RoCE device
+        /* ADDED: source Global Identifier index. Index 2 on this hardware RoCE device
          * corresponds to the IPv4-mapped Global Identifier (e.g. ::ffff:10.0.0.x),
-         * which is the correct one to use for Soft-RoCE over a virtual bridge. */
-        qp_attr.ah_attr.grh.sgid_index = 1;
+         * which is the correct entry for the CloudLab Mellanox RoCE interface. */
+        qp_attr.ah_attr.grh.sgid_index = 2;
         /* ADDED: hop limit (equivalent to IP Time-To-Live). Set to 1 since all
          * communication stays within the local virtual network — no routing needed. */
         qp_attr.ah_attr.grh.hop_limit  = 1;
 
         /* ADDED: debug print showing the Queue Pair transition details so we can verify
          * the correct Global Identifiers are being exchanged during startup. */
-        fprintf(stderr, "RTR: qpn=0x%x target_qpn=0x%x mtu=%d sgid_idx=1 dgid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+        fprintf(stderr, "RTR: qpn=0x%x target_qpn=0x%x mtu=%d sgid_idx=2 dgid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
                 qp->qp_num, target_qp_num, qp_attr.path_mtu,
                 remote_gid->raw[0], remote_gid->raw[1], remote_gid->raw[2], remote_gid->raw[3],
                 remote_gid->raw[4], remote_gid->raw[5], remote_gid->raw[6], remote_gid->raw[7],

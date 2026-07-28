@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <malloc.h>
+#include <errno.h>
+#include <string.h>
 
 #include "kvs/sock.h"
 #include "kvs/ib.h"
@@ -63,8 +65,8 @@ int connect_qp_server()
         union ibv_gid local_gid;
         memset(&local_gid, 0, sizeof(local_gid));
         /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
-         * index 1. gid_ret is checked in the debug print below; 0 means success. */
-        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+         * index 2. gid_ret is checked in the debug print below; 0 means success. */
+        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         /* ADDED: debug print showing the storage node's own Global Identifier so we can
          * verify during startup that the correct address is being advertised to kvs. */
         fprintf(stderr, "SERVER connect_qp_server: num_qps=%d gid_ret=%d gid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
@@ -198,7 +200,7 @@ int connect_qp_client()
         union ibv_gid local_gid;
         /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
          * index 1 of this kvs node's RDMA device. */
-        ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+        ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         for (i = 0; i < ib_res.num_qps; i++) {
             local_qp_info[i].lid = ib_res.port_attr.lid;
             local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;
@@ -445,8 +447,22 @@ int setup_ib()
         memset(&srq_init_attr, 0, sizeof(struct ibv_srq_init_attr));
         srq_init_attr.attr.max_wr = ib_res.dev_attr.max_srq_wr;
         srq_init_attr.attr.max_sge = 1;
+	
+	fprintf(stderr,
+        	"[DEBUG] Creating SRQ: max_wr=%u max_sge=%u\n",
+        	srq_init_attr.attr.max_wr,
+        	srq_init_attr.attr.max_sge);
 
-        ib_res.srq = ibv_create_srq(ib_res.pd, &srq_init_attr);
+	errno = 0;
+	ib_res.srq = ibv_create_srq(ib_res.pd, &srq_init_attr);
+
+	fprintf(stderr,
+        	"[DEBUG] SRQ result: ptr=%p errno=%d (%s)\n",
+        	(void *)ib_res.srq,
+        	errno,
+        	strerror(errno));
+
+	check(ib_res.srq != NULL, "Failed to create SRQ");
 
         // Create qps
         ib_res.qp = (struct ibv_qp **) calloc(ib_res.num_qps, sizeof(struct ibv_qp *));
@@ -462,18 +478,45 @@ int setup_ib()
 #endif
             qp_init_attr.recv_cq = ib_res.cq[i % config_info.num_storage_managers];
             qp_init_attr.srq = ib_res.srq;
-#ifdef ENABLE_MAX_QP_WR
-            qp_init_attr.cap.max_send_wr = ib_res.dev_attr.max_qp_wr;
-            qp_init_attr.cap.max_recv_wr = ib_res.dev_attr.max_qp_wr;
-#else
+/*
+             * Avoid requesting the device's absolute maximum queue depth.
+             * Older mlx5 providers may reject that request with EINVAL.
+             */
             qp_init_attr.cap.max_send_wr = 1000;
-            qp_init_attr.cap.max_recv_wr = 1000;
-#endif
+
+            /*
+             * This QP uses a Shared Receive Queue, so it does not have
+             * its own receive queue. Keep the per-QP receive limits at 0.
+             */
+            qp_init_attr.cap.max_recv_wr = 0;
             qp_init_attr.cap.max_send_sge = 1;
-            qp_init_attr.cap.max_recv_sge = 1;
+            qp_init_attr.cap.max_recv_sge = 0;
+            qp_init_attr.cap.max_inline_data = 0;
             qp_init_attr.qp_type = IBV_QPT_RC;
 
+            fprintf(stderr,
+                    "[DEBUG] Creating QP[%d]: "
+                    "send_wr=%u recv_wr=%u send_sge=%u recv_sge=%u "
+                    "send_cq=%p recv_cq=%p srq=%p\n",
+                    i,
+                    qp_init_attr.cap.max_send_wr,
+                    qp_init_attr.cap.max_recv_wr,
+                    qp_init_attr.cap.max_send_sge,
+                    qp_init_attr.cap.max_recv_sge,
+                    (void *)qp_init_attr.send_cq,
+                    (void *)qp_init_attr.recv_cq,
+                    (void *)qp_init_attr.srq);
+
+            errno = 0;
             ib_res.qp[i] = ibv_create_qp(ib_res.pd, &qp_init_attr);
+
+            fprintf(stderr,
+                    "[DEBUG] QP[%d] result: ptr=%p errno=%d (%s)\n",
+                    i,
+                    (void *)ib_res.qp[i],
+                    errno,
+                    strerror(errno));
+
             check(ib_res.qp[i] != NULL, "Failed to create qp[%d]", i);
         }
     } else {

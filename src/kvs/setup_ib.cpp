@@ -63,8 +63,8 @@ int connect_qp_server()
         union ibv_gid local_gid;
         memset(&local_gid, 0, sizeof(local_gid));
         /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
-         * index 1. gid_ret is checked in the debug print below; 0 means success. */
-        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+         * index 2. gid_ret is checked in the debug print below; 0 means success. */
+        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         /* ADDED: debug print showing the storage node's own Global Identifier so we can
          * verify during startup that the correct address is being advertised to kvs. */
         fprintf(stderr, "SERVER connect_qp_server: num_qps=%d gid_ret=%d gid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
@@ -198,7 +198,7 @@ int connect_qp_client()
         union ibv_gid local_gid;
         /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
          * index 1 of this kvs node's RDMA device. */
-        ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+        ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         for (i = 0; i < ib_res.num_qps; i++) {
             local_qp_info[i].lid = ib_res.port_attr.lid;
             local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;
@@ -335,9 +335,54 @@ int setup_ib()
     dev_list = ibv_get_device_list(NULL);
     check(dev_list != NULL, "Failed to get ib device list");
 
-    // create IB context
-    ib_res.ctx = ibv_open_device(*dev_list);
-    check(ib_res.ctx != NULL, "Failed to open ib device");
+    // Select the RDMA interface connected to the 10.1.1.x network.
+    {
+        struct ibv_device *selected_dev = NULL;
+
+        for (int i = 0; dev_list[i] != NULL; i++) {
+            const char *device_name = ibv_get_device_name(dev_list[i]);
+
+            fprintf(stderr,
+                    "[DEBUG] RDMA candidate[%d]: %s\n",
+                    i,
+                    device_name);
+
+            if (strcmp(device_name, "mlx5_3") == 0) {
+                selected_dev = dev_list[i];
+                break;
+            }
+        }
+
+        check(selected_dev != NULL,
+              "Unable to find required RDMA device mlx5_3");
+
+        ib_res.ctx = ibv_open_device(selected_dev);
+        check(ib_res.ctx != NULL, "Failed to open ib device");
+
+        fprintf(stderr,
+                "[DEBUG] Selected RDMA device: %s\n",
+                ibv_get_device_name(selected_dev));
+    }
+
+    union ibv_gid dbg_gid;
+    memset(&dbg_gid, 0, sizeof(dbg_gid));
+
+    ret = ibv_query_gid(ib_res.ctx, IB_PORT, 2, &dbg_gid);
+
+    fprintf(stderr, "[DEBUG] ibv_query_gid(port=%d,index=2) ret=%d\n",
+            IB_PORT, ret);
+
+    fprintf(stderr,
+            "[DEBUG] GID2=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+            dbg_gid.raw[0], dbg_gid.raw[1],
+            dbg_gid.raw[2], dbg_gid.raw[3],
+            dbg_gid.raw[4], dbg_gid.raw[5],
+            dbg_gid.raw[6], dbg_gid.raw[7],
+            dbg_gid.raw[8], dbg_gid.raw[9],
+            dbg_gid.raw[10], dbg_gid.raw[11],
+            dbg_gid.raw[12], dbg_gid.raw[13],
+            dbg_gid.raw[14], dbg_gid.raw[15]);
+
 
     // allocate protection domain
     ib_res.pd = ibv_alloc_pd(ib_res.ctx);

@@ -337,9 +337,54 @@ int setup_ib()
     dev_list = ibv_get_device_list(NULL);
     check(dev_list != NULL, "Failed to get ib device list");
 
-    // create IB context
-    ib_res.ctx = ibv_open_device(*dev_list);
-    check(ib_res.ctx != NULL, "Failed to open ib device");
+    // Select the RDMA interface connected to the 10.1.1.x network.
+    {
+        struct ibv_device *selected_dev = NULL;
+
+        for (int i = 0; dev_list[i] != NULL; i++) {
+            const char *device_name = ibv_get_device_name(dev_list[i]);
+
+            fprintf(stderr,
+                    "[DEBUG] RDMA candidate[%d]: %s\n",
+                    i,
+                    device_name);
+
+            if (strcmp(device_name, "mlx5_3") == 0) {
+                selected_dev = dev_list[i];
+                break;
+            }
+        }
+
+        check(selected_dev != NULL,
+              "Unable to find required RDMA device mlx5_3");
+
+        ib_res.ctx = ibv_open_device(selected_dev);
+        check(ib_res.ctx != NULL, "Failed to open ib device");
+
+        fprintf(stderr,
+                "[DEBUG] Selected RDMA device: %s\n",
+                ibv_get_device_name(selected_dev));
+    }
+
+    union ibv_gid dbg_gid;
+    memset(&dbg_gid, 0, sizeof(dbg_gid));
+
+    ret = ibv_query_gid(ib_res.ctx, IB_PORT, 2, &dbg_gid);
+
+    fprintf(stderr, "[DEBUG] ibv_query_gid(port=%d,index=2) ret=%d\n",
+            IB_PORT, ret);
+
+    fprintf(stderr,
+            "[DEBUG] GID2=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+            dbg_gid.raw[0], dbg_gid.raw[1],
+            dbg_gid.raw[2], dbg_gid.raw[3],
+            dbg_gid.raw[4], dbg_gid.raw[5],
+            dbg_gid.raw[6], dbg_gid.raw[7],
+            dbg_gid.raw[8], dbg_gid.raw[9],
+            dbg_gid.raw[10], dbg_gid.raw[11],
+            dbg_gid.raw[12], dbg_gid.raw[13],
+            dbg_gid.raw[14], dbg_gid.raw[15]);
+
 
     // allocate protection domain
     ib_res.pd = ibv_alloc_pd(ib_res.ctx);
@@ -538,8 +583,8 @@ int setup_ib()
             qp_init_attr.send_cq = ib_res.cq[i];
             qp_init_attr.recv_cq = ib_res.cq[i];
 #ifdef ENABLE_MAX_QP_WR
-            qp_init_attr.cap.max_send_wr = ib_res.dev_attr.max_qp_wr;
-            qp_init_attr.cap.max_recv_wr = ib_res.dev_attr.max_qp_wr;
+            qp_init_attr.cap.max_send_wr = 1000;
+            qp_init_attr.cap.max_recv_wr = 1000;
 #else
             qp_init_attr.cap.max_send_wr = 1000;
             qp_init_attr.cap.max_recv_wr = 1000;

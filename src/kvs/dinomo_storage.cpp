@@ -207,9 +207,9 @@ void *ib_connection_manager_thread(void *arg)
          * field in QPInfo and never called ibv_query_gid(). RoCE and Soft-RoCE require
          * each side to know the other's Global Identifier to build the Global Routing
          * Header on every packet — without it all RDMA packets are silently dropped.
-         * Index 1 selects the RoCEv2 Global Identifier entry for this port. */
+         * Index 2 selects the RoCEv2 Global Identifier entry for this port. */
         union ibv_gid local_gid;
-        ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+        ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         for (i = 0; i < config_info.threads_per_memory; i++) {
             local_qp_info[i].lid = ib_res.port_attr.lid;
             local_qp_info[i].qp_num = ib_res.qp[(peer_idx * config_info.threads_per_memory) + i]->qp_num;

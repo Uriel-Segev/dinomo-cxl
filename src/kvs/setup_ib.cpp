@@ -63,8 +63,8 @@ int connect_qp_server()
         union ibv_gid local_gid;
         memset(&local_gid, 0, sizeof(local_gid));
         /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
-         * index 1. gid_ret is checked in the debug print below; 0 means success. */
-        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+         * index 2. gid_ret is checked in the debug print below; 0 means success. */
+        int gid_ret = ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         /* ADDED: debug print showing the storage node's own Global Identifier so we can
          * verify during startup that the correct address is being advertised to kvs. */
         fprintf(stderr, "SERVER connect_qp_server: num_qps=%d gid_ret=%d gid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
@@ -198,7 +198,7 @@ int connect_qp_client()
         union ibv_gid local_gid;
         /* ADDED: ibv_query_gid fills local_gid with the Global Identifier for port 1,
          * index 1 of this kvs node's RDMA device. */
-        ibv_query_gid(ib_res.ctx, IB_PORT, 1, &local_gid);
+        ibv_query_gid(ib_res.ctx, IB_PORT, 2, &local_gid);
         for (i = 0; i < ib_res.num_qps; i++) {
             local_qp_info[i].lid = ib_res.port_attr.lid;
             local_qp_info[i].qp_num = ib_res.qp[i]->qp_num;

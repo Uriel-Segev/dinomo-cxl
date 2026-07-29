@@ -50,7 +50,11 @@ PREPARE_IB_CONFIG() {
 #}
 
 for ((i = 0; i < ${numMaster}; i++)); do
-    ssh ${REMOTE_USER_NAME}@${MasterNodeIPs[$i]} ${PREPARE_CLUSTER_CONFIG}
+    if [[ "${MasterNodeIPs[$i]}" == "10.1.1.3" ]]; then
+        eval "${PREPARE_CLUSTER_CONFIG}"
+    else
+        ssh ${REMOTE_USER_NAME}@${MasterNodeIPs[$i]} "${PREPARE_CLUSTER_CONFIG}"
+    fi
 done
 
 for ((i = 0; i < ${numRouting}; i++)); do
@@ -61,10 +65,10 @@ for ((i = 0; i < ${numBenchmark}; i++)); do
     ssh ${REMOTE_USER_NAME}@${BenchmarkNodeIPs[$i]} ${PREPARE_CLUSTER_CONFIG}
 done
 
-pidList=[]
+pidList=()
 for ((i = 0; i < ${numMemory}; i++)); do
     ssh ${REMOTE_USER_NAME}@${MemoryNodeIPs[$i]} ${PREPARE_CLUSTER_CONFIG}
-    if ssh ${REMOTE_USER_NAME}@${MemoryNodeIPs[$i]} "ifconfig | grep ib0"
+    if true
     then
         :
     else
@@ -76,7 +80,7 @@ done
 
 for ((i = 0; i < ${numStorage}; i++)); do
     ssh ${REMOTE_USER_NAME}@${StorageNodeIPs[$i]} ${PREPARE_CLUSTER_CONFIG}
-    if ssh ${REMOTE_USER_NAME}@${StorageNodeIPs[$i]} "ifconfig | grep ib0"
+    if true
     then
         :
     else

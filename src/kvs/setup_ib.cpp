@@ -349,14 +349,14 @@ int setup_ib()
                     i,
                     device_name);
 
-            if (strcmp(device_name, "mlx5_3") == 0) {
+            if (strcmp(device_name, "mlx4_0") == 0) {
                 selected_dev = dev_list[i];
                 break;
             }
         }
 
         check(selected_dev != NULL,
-              "Unable to find required RDMA device mlx5_3");
+              "Unable to find required RDMA device mlx4_0");
 
         ib_res.ctx = ibv_open_device(selected_dev);
         check(ib_res.ctx != NULL, "Failed to open ib device");

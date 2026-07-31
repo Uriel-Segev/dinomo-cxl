@@ -1,3 +1,4 @@
+#include <iostream>
 #include <stdlib.h>
 
 #include "benchmark.pb.h"

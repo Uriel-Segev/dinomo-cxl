@@ -62,40 +62,17 @@ int modify_qp_to_rts(struct ibv_qp *qp, uint32_t target_qp_num, uint16_t target_
         qp_attr.ah_attr.sl             = IB_SL;
         qp_attr.ah_attr.src_path_bits  = 0;
         qp_attr.dest_qp_num            = target_qp_num;
-        /* CHANGED: the original code set is_global=0 and routed using only the Local
-         * Identifier (dlid = target_lid). That works on physical InfiniBand but not on
-         * RoCE or Soft-RoCE, which run over Ethernet and require a Global Routing Header
-         * in every packet. The following lines replace the original three lines:
-         *   qp_attr.ah_attr.is_global = 0;
-         *   qp_attr.ah_attr.dlid      = target_lid;
-         *   (no grh fields were set)
-         */
+        /* Native InfiniBand routes through Local Identifiers rather than
+         * the RoCE Global Routing Header. */
+        qp_attr.ah_attr.is_global      = 0;
+        qp_attr.ah_attr.dlid           = target_lid;
 
-        /* CHANGED from 0 to 1: enables the Global Routing Header in every outgoing
-         * RDMA packet. Without this, Soft-RoCE drops all packets silently. */
-        qp_attr.ah_attr.is_global      = 1;
-        /* CHANGED from target_lid to 0: the Local Identifier is not used for routing
-         * in RoCE or Soft-RoCE — routing is done via the Global Identifier instead. */
-        qp_attr.ah_attr.dlid           = 0;
-        /* ADDED: destination Global Identifier — the remote side's address on the
-         * RDMA network, equivalent to an IP address for InfiniBand/RoCE routing. */
-        qp_attr.ah_attr.grh.dgid       = *remote_gid;
-        /* ADDED: source Global Identifier index. Index 2 on this hardware RoCE device
-         * corresponds to the IPv4-mapped Global Identifier (e.g. ::ffff:10.0.0.x),
-         * which is the correct entry for the CloudLab Mellanox RoCE interface. */
-        qp_attr.ah_attr.grh.sgid_index = 2;
-        /* ADDED: hop limit (equivalent to IP Time-To-Live). Set to 1 since all
-         * communication stays within the local virtual network — no routing needed. */
-        qp_attr.ah_attr.grh.hop_limit  = 1;
-
-        /* ADDED: debug print showing the Queue Pair transition details so we can verify
-         * the correct Global Identifiers are being exchanged during startup. */
-        fprintf(stderr, "RTR: qpn=0x%x target_qpn=0x%x mtu=%d sgid_idx=2 dgid=%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
-                qp->qp_num, target_qp_num, qp_attr.path_mtu,
-                remote_gid->raw[0], remote_gid->raw[1], remote_gid->raw[2], remote_gid->raw[3],
-                remote_gid->raw[4], remote_gid->raw[5], remote_gid->raw[6], remote_gid->raw[7],
-                remote_gid->raw[8], remote_gid->raw[9], remote_gid->raw[10], remote_gid->raw[11],
-                remote_gid->raw[12], remote_gid->raw[13], remote_gid->raw[14], remote_gid->raw[15]);
+        fprintf(stderr,
+                "RTR: qpn=0x%x target_qpn=0x%x mtu=%d dlid=%u native_ib=1\n",
+                qp->qp_num,
+                target_qp_num,
+                qp_attr.path_mtu,
+                target_lid);
 
         ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
                 IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |

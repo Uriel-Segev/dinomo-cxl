@@ -1,3 +1,4 @@
+#include <iostream>
 #include "route/routing_handlers.hpp"
 #include "yaml-cpp/yaml.h"
 

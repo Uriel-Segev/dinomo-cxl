@@ -151,6 +151,15 @@ create_vm() {
   local ram="\$3"
   local mgmt_ip="\$4"
   local rdma_ip="\$5"
+  local mgmt_mac
+  local rdma_mac
+  case "\$name" in
+    storage) mgmt_mac="52:54:00:00:00:25"; rdma_mac="52:54:00:10:00:25" ;;
+    kvs)     mgmt_mac="52:54:00:00:00:50"; rdma_mac="52:54:00:10:00:50" ;;
+    route)   mgmt_mac="52:54:00:00:00:99"; rdma_mac="52:54:00:10:00:99" ;;
+    monitor) mgmt_mac="52:54:00:00:00:14"; rdma_mac="52:54:00:10:00:14" ;;
+    bench)   mgmt_mac="52:54:00:00:00:67"; rdma_mac="52:54:00:10:00:67" ;;
+  esac
 
   if sudo virsh dominfo "dinomo-\${name}" &>/dev/null; then
     echo "  dinomo-\${name} already exists, skipping."
@@ -168,54 +177,51 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - \$(cat ~/.ssh/authorized_keys | head -1)
-package_update: true
-packages:
-  - build-essential
-  - cmake
-  - git
-  - python3
-  - libibverbs-dev
-  - librdmacm-dev
-  - rdma-core
-  - libtbb-dev
-  - libzmq3-dev
-  - libboost-all-dev
-  - libyaml-cpp-dev
-  - libpmemobj-dev
-  - libpmem-dev
-  - numactl
-  - wget
+      - \$(cat ~/.ssh/id_ed25519.pub)
+package_update: false
+packages: []
 runcmd:
+  - systemctl enable --now systemd-networkd
+  - netplan generate
+  - netplan apply
+  - sleep 5
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git python3 libibverbs-dev librdmacm-dev rdma-core libtbb-dev libzmq3-dev libboost-all-dev libyaml-cpp-dev libpmemobj-dev libpmem-dev numactl wget
   - echo "cloud-init done" > /tmp/cloud-init-done
 USERDATA
 
-  # Build cloud-init network config (static mgmt IP + optional rdma IP)
+  # Build DHCP management network plus static RDMA network.
   if [ -n "\${rdma_ip}" ]; then
     cat > /tmp/network-\${name}.yaml << NETCFG
 version: 2
+renderer: networkd
 ethernets:
   enp1s0:
     dhcp4: false
     addresses: [\${mgmt_ip}/24]
-    gateway4: 192.168.122.1
+    routes:
+      - to: default
+        via: 192.168.122.1
     nameservers:
-      addresses: [8.8.8.8]
+      addresses: [192.168.122.1]
   enp2s0:
     dhcp4: false
     addresses: [\${rdma_ip}/24]
 NETCFG
-    EXTRA_NIC="--network network=rdma-net,model=virtio"
+    EXTRA_NIC="--network network=rdma-net,model=virtio,mac=\${rdma_mac}"
   else
     cat > /tmp/network-\${name}.yaml << NETCFG
 version: 2
+renderer: networkd
 ethernets:
   enp1s0:
     dhcp4: false
     addresses: [\${mgmt_ip}/24]
-    gateway4: 192.168.122.1
+    routes:
+      - to: default
+        via: 192.168.122.1
     nameservers:
-      addresses: [8.8.8.8]
+      addresses: [192.168.122.1]
 NETCFG
     EXTRA_NIC=""
   fi
@@ -232,6 +238,7 @@ NETCFG
     --disk path=\${DATA}/dinomo-\${name}.qcow2,format=qcow2 \
     --disk path=/tmp/seed-\${name}.iso,device=cdrom \
     --network network=default,model=virtio \
+    --mac \${mgmt_mac} \
     \${EXTRA_NIC} \
     --os-type linux \
     --os-variant ubuntu20.04 \
@@ -241,6 +248,13 @@ NETCFG
 
   echo "  dinomo-\${name} created and booting."
 }
+
+# Reserve DINOMO management addresses in libvirt DHCP.
+sudo virsh net-update default add ip-dhcp-host "<host mac='52:54:00:00:00:25' name='dinomo-storage' ip='192.168.122.25'/>" --live --config 2>/dev/null || true
+sudo virsh net-update default add ip-dhcp-host "<host mac='52:54:00:00:00:50' name='dinomo-kvs' ip='192.168.122.150'/>" --live --config 2>/dev/null || true
+sudo virsh net-update default add ip-dhcp-host "<host mac='52:54:00:00:00:99' name='dinomo-route' ip='192.168.122.99'/>" --live --config 2>/dev/null || true
+sudo virsh net-update default add ip-dhcp-host "<host mac='52:54:00:00:00:14' name='dinomo-monitor' ip='192.168.122.114'/>" --live --config 2>/dev/null || true
+sudo virsh net-update default add ip-dhcp-host "<host mac='52:54:00:00:00:67' name='dinomo-bench' ip='192.168.122.167'/>" --live --config 2>/dev/null || true
 
 create_vm storage 8  24576 ${VM_STORAGE} "10.0.0.1"
 create_vm kvs     8  24576 ${VM_KVS}     "10.0.0.2"
@@ -260,7 +274,7 @@ for name in storage kvs route monitor bench; do
         route)   echo ${VM_ROUTE} ;;
         monitor) echo ${VM_MONITOR} ;;
         bench)   echo ${VM_BENCH} ;;
-      esac) 'cat /tmp/cloud-init-done 2>/dev/null' 2>/dev/null)
+      esac) 'cat /tmp/cloud-init-done 2>/dev/null' 2>/dev/null || true)
     if [ "\${done}" = "cloud-init done" ]; then
       echo " ready."
       break
@@ -343,21 +357,24 @@ fix = """
 marker = 'pthread_create(&server_manager_tid'
 idx = content.find(marker)
 if idx == -1:
-    print("ERROR: could not find insertion point for fix")
-    exit(1)
+    print("PMDK fix marker not found; skipping because this fork may already contain the fix.")
+else:
+    line_start = content.rfind('\n', 0, idx) + 1
+    content = content[:line_start] + fix + content[line_start:]
 
-# Go back to start of that line
-line_start = content.rfind('\n', 0, idx) + 1
-content = content[:line_start] + fix + content[line_start:]
+    with open('src/kvs/dinomo_storage.cpp', 'w') as f:
+        f.write(content)
 
-with open('src/kvs/dinomo_storage.cpp', 'w') as f:
-    f.write(content)
-
-print("Fix applied successfully.")
+    print("Fix applied successfully.")
 PYFIX
 fi
 
-# Build
+# Build bundled libbloom first
+cd src/kvs/libbloom
+make -j$(nproc)
+cd ../../..
+
+# Build DINOMO
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release > /tmp/cmake.log 2>&1
 make -j$(nproc) > /tmp/make.log 2>&1
@@ -380,12 +397,12 @@ echo ""
 echo "  Deploying DINOMO config files..."
 for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH &
-    scp -o StrictHostKeyChecking=no \
-      /dev/stdin ${VM_USER}@${vm_ip}:~/projects/DINOMO/conf/dinomo-base.yml << 'CONFEOF'
+    ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} \
+      "cat > ~/projects/DINOMO/conf/dinomo-base.yml" << 'CONFEOF'
 $(cat "${SCRIPT_DIR}/conf/dinomo-base.yml")
 CONFEOF
-    scp -o StrictHostKeyChecking=no \
-      /dev/stdin ${VM_USER}@${vm_ip}:~/projects/DINOMO/conf/dinomo-vm-config.yml << 'CONFEOF'
+    ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} \
+      "cat > ~/projects/DINOMO/conf/dinomo-vm-config.yml" << 'CONFEOF'
 $(cat "${SCRIPT_DIR}/conf/dinomo-vm-config.yml")
 CONFEOF
 ENDSSH

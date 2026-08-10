@@ -9,12 +9,12 @@
 # -------------------------------------------------------
 # CHANGE THIS for each new CloudLab experiment
 # -------------------------------------------------------
-CLOUDLAB_HOST="amd225.utah.cloudlab.us"
+CLOUDLAB_HOST="amd136.utah.cloudlab.us"
 
 # -------------------------------------------------------
 # Change these if your SSH setup is different
 # -------------------------------------------------------
-SSH_USER="Uriel"
+SSH_USER="vinothg"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 
 # -------------------------------------------------------
@@ -35,7 +35,7 @@ VM_MONITOR="192.168.122.114"
 VM_BENCH="192.168.122.167"
 VM_USER="ubuntu"
 DINOMO_DIR="~/projects/DINOMO"
-DINOMO_REPO="https://github.com/utsaslab/dinomo.git"  # update to your fork when ready
+DINOMO_REPO="https://github.com/Uriel-Segev/dinomo-cxl.git"  # update to your fork when ready
 
 # -------------------------------------------------------
 # Node-type-specific settings

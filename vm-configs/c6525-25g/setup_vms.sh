@@ -31,8 +31,23 @@ echo ""
 # Phase 1: Prepare the host (install KVM, create networks)
 # -------------------------------------------------------
 echo "[Phase 1/4] Preparing host..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << 'ENDSSH'
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "HOST_SUDO_PASS='${HOST_SUDO_PASS}' bash -s" << 'ENDSSH'
 set -e
+mkdir -p /tmp/.dinomo-askpass
+cat << ASKPASS > /tmp/.dinomo-askpass/askpass.sh
+#!/bin/bash
+echo '${HOST_SUDO_PASS}'
+ASKPASS
+chmod 700 /tmp/.dinomo-askpass/askpass.sh
+sudo() { SUDO_ASKPASS=/tmp/.dinomo-askpass/askpass.sh command sudo -A "$@"; }
+
+# Ensure host has an SSH key to access guest VMs
+if [ ! -f ~/.ssh/id_ed25519.pub ] && [ ! -f ~/.ssh/id_rsa.pub ]; then
+  ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 >/dev/null 2>&1 || true
+fi
+if [ -f ~/.ssh/id_ed25519.pub ] && ! grep -q -f ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys 2>/dev/null; then
+  cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+fi
 
 echo "  Installing KVM and libvirt..."
 sudo apt-get update -qq
@@ -97,8 +112,15 @@ ENDSSH
 # -------------------------------------------------------
 echo ""
 echo "[Phase 2/4] Creating VM disk images..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "HOST_SUDO_PASS='${HOST_SUDO_PASS}' bash -s" << ENDSSH
 set -e
+mkdir -p /tmp/.dinomo-askpass
+cat << ASKPASS > /tmp/.dinomo-askpass/askpass.sh
+#!/bin/bash
+echo '\${HOST_SUDO_PASS}'
+ASKPASS
+chmod 700 /tmp/.dinomo-askpass/askpass.sh
+sudo() { SUDO_ASKPASS=/tmp/.dinomo-askpass/askpass.sh command sudo -A "\$@"; }
 
 DATA="${HOST_DATA_DIR}"
 BASE="${HOST_BASE_IMAGE}"
@@ -136,14 +158,22 @@ echo ""
 echo "[Phase 3/4] Creating and booting VMs..."
 
 # VM definitions: name, vcpus, ram_mb, mgmt_ip, rdma_ip (empty = no rdma NIC)
-declare -A VM_VCPUS=( [storage]=8 [kvs]=8 [route]=4 [monitor]=4 [bench]=4 )
-declare -A VM_RAM=(   [storage]=24576 [kvs]=24576 [route]=8192 [monitor]=8192 [bench]=16384 )
+declare -A VM_VCPUS=( [storage]=4 [kvs]=4 [route]=2 [monitor]=2 [bench]=2 )
+declare -A VM_RAM=(   [storage]=16384 [kvs]=16384 [route]=4096 [monitor]=4096 [bench]=8192 )
 declare -A VM_MGMT=(  [storage]=${VM_STORAGE} [kvs]=${VM_KVS} [route]=${VM_ROUTE} [monitor]=${VM_MONITOR} [bench]=${VM_BENCH} )
 declare -A VM_RDMA=(  [storage]="10.0.0.1" [kvs]="10.0.0.2" [route]="" [monitor]="" [bench]="" )
 
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "HOST_SUDO_PASS='${HOST_SUDO_PASS}' bash -s" << ENDSSH
 set -e
+mkdir -p /tmp/.dinomo-askpass
+cat << ASKPASS > /tmp/.dinomo-askpass/askpass.sh
+#!/bin/bash
+echo '\${HOST_SUDO_PASS}'
+ASKPASS
+chmod 700 /tmp/.dinomo-askpass/askpass.sh
+sudo() { SUDO_ASKPASS=/tmp/.dinomo-askpass/askpass.sh command sudo -A "\$@"; }
 DATA="${HOST_DATA_DIR}"
+BASE="${HOST_BASE_IMAGE}"
 
 create_vm() {
   local name="\$1"
@@ -151,13 +181,17 @@ create_vm() {
   local ram="\$3"
   local mgmt_ip="\$4"
   local rdma_ip="\$5"
+  local mac_mgmt="\$6"
+  local mac_rdma="\$7"
 
   if sudo virsh dominfo "dinomo-\${name}" &>/dev/null; then
-    echo "  dinomo-\${name} already exists, skipping."
-    return
+    echo "  Re-creating dinomo-\${name} to apply fixed network configuration..."
+    sudo virsh destroy "dinomo-\${name}" 2>/dev/null || true
+    sudo virsh undefine "dinomo-\${name}" 2>/dev/null || true
+    sudo qemu-img create -f qcow2 -b "\${BASE}" -F qcow2 "\${DATA}/dinomo-\${name}.qcow2" 20G
   fi
 
-  echo "  Creating dinomo-\${name} (${vcpus}vCPU, ${ram}MB)..."
+  echo "  Creating dinomo-\${name} (\${vcpus}vCPU, \${ram}MB)..."
 
   # Build cloud-init user-data
   cat > /tmp/user-data-\${name}.yaml << USERDATA
@@ -168,7 +202,7 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - \$(cat ~/.ssh/authorized_keys | head -1)
+\$(sed 's/^/      - /' ~/.ssh/authorized_keys)
 package_update: true
 packages:
   - build-essential
@@ -186,32 +220,39 @@ packages:
   - libpmem-dev
   - numactl
   - wget
+  - linux-modules-extra-generic
 runcmd:
   - echo "cloud-init done" > /tmp/cloud-init-done
 USERDATA
 
-  # Build cloud-init network config (static mgmt IP + optional rdma IP)
+  # Build cloud-init network config matching by MAC address
   if [ -n "\${rdma_ip}" ]; then
     cat > /tmp/network-\${name}.yaml << NETCFG
 version: 2
 ethernets:
-  enp1s0:
-    dhcp4: false
+  eth0:
+    match:
+      macaddress: "\${mac_mgmt}"
+    set-name: eth0
     addresses: [\${mgmt_ip}/24]
     gateway4: 192.168.122.1
     nameservers:
       addresses: [8.8.8.8]
-  enp2s0:
-    dhcp4: false
+  eth1:
+    match:
+      macaddress: "\${mac_rdma}"
+    set-name: eth1
     addresses: [\${rdma_ip}/24]
 NETCFG
-    EXTRA_NIC="--network network=rdma-net,model=virtio"
+    EXTRA_NIC="--network network=rdma-net,model=virtio,mac=\${mac_rdma}"
   else
     cat > /tmp/network-\${name}.yaml << NETCFG
 version: 2
 ethernets:
-  enp1s0:
-    dhcp4: false
+  eth0:
+    match:
+      macaddress: "\${mac_mgmt}"
+    set-name: eth0
     addresses: [\${mgmt_ip}/24]
     gateway4: 192.168.122.1
     nameservers:
@@ -231,9 +272,8 @@ NETCFG
     --memory \${ram} \
     --disk path=\${DATA}/dinomo-\${name}.qcow2,format=qcow2 \
     --disk path=/tmp/seed-\${name}.iso,device=cdrom \
-    --network network=default,model=virtio \
+    --network network=default,model=virtio,mac=\${mac_mgmt} \
     \${EXTRA_NIC} \
-    --os-type linux \
     --os-variant ubuntu20.04 \
     --import \
     --noautoconsole \
@@ -242,11 +282,11 @@ NETCFG
   echo "  dinomo-\${name} created and booting."
 }
 
-create_vm storage 8  24576 ${VM_STORAGE} "10.0.0.1"
-create_vm kvs     8  24576 ${VM_KVS}     "10.0.0.2"
-create_vm route   4  8192  ${VM_ROUTE}   ""
-create_vm monitor 4  8192  ${VM_MONITOR} ""
-create_vm bench   4  16384 ${VM_BENCH}   ""
+create_vm storage ${VM_VCPUS[storage]} ${VM_RAM[storage]} ${VM_STORAGE} "10.0.0.1" "52:54:00:12:22:01" "52:54:00:10:00:01"
+create_vm kvs     ${VM_VCPUS[kvs]}     ${VM_RAM[kvs]}     ${VM_KVS}     "10.0.0.2" "52:54:00:12:22:02" "52:54:00:10:00:02"
+create_vm route   ${VM_VCPUS[route]}   ${VM_RAM[route]}   ${VM_ROUTE}   ""         "52:54:00:12:22:03" ""
+create_vm monitor ${VM_VCPUS[monitor]} ${VM_RAM[monitor]} ${VM_MONITOR} ""         "52:54:00:12:22:04" ""
+create_vm bench   ${VM_VCPUS[bench]}   ${VM_RAM[bench]}   ${VM_BENCH}   ""         "52:54:00:12:22:05" ""
 
 echo "  Waiting for all VMs to finish booting and cloud-init (~5 min)..."
 for name in storage kvs route monitor bench; do
@@ -260,7 +300,7 @@ for name in storage kvs route monitor bench; do
         route)   echo ${VM_ROUTE} ;;
         monitor) echo ${VM_MONITOR} ;;
         bench)   echo ${VM_BENCH} ;;
-      esac) 'cat /tmp/cloud-init-done 2>/dev/null' 2>/dev/null)
+      esac) 'cat /tmp/cloud-init-done 2>/dev/null' 2>/dev/null || true)
     if [ "\${done}" = "cloud-init done" ]; then
       echo " ready."
       break
@@ -281,12 +321,39 @@ ENDSSH
 echo ""
 echo "[Phase 4/4] Cloning and building DINOMO on each VM..."
 
+# Clear stale VM SSH host keys from sabro's known_hosts.
+# VMs were re-created with fresh host keys, so old entries must be removed
+# or SSH will refuse connection even with StrictHostKeyChecking=no.
+echo "  Clearing stale VM host keys from sabro known_hosts..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+for vm_ip in ${VM_STORAGE} ${VM_KVS}; do
+  ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} "
+    # Install linux-modules-extra if rdma_rxe is missing (e.g. on first run or kernel update)
+    if ! modinfo rdma_rxe &>/dev/null; then
+      echo '  Installing linux-modules-extra...'
+      sudo apt-get install -y -qq linux-modules-extra-\$(uname -r) || \
+        sudo apt-get install -y -qq linux-modules-extra-generic
+    fi
+    sudo modprobe rdma_rxe
+    sudo rdma link delete rxe0/1 2>/dev/null || true
+    sudo rdma link add rxe0 type rxe netdev ${VM_RDMA_IFACE}
+    state=\$(rdma link show | grep rxe0 | awk '{print \$4}')
+    echo \"  rxe0 on \$(hostname): \${state}\"
+  " &
+done
+wait
+for ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
+  ssh-keygen -R "${ip}" -f ~/.ssh/known_hosts 2>/dev/null || true
+done
+echo '  Done.'
+ENDSSH
+
 build_on_vm() {
   local vm_ip="$1"
   local vm_name="$2"
   echo "  Building on ${vm_name} (${vm_ip})..."
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
-ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} 'bash -s' << 'VMSSH'
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${VM_USER}@${vm_ip} 'bash -s' << 'VMSSH'
 set -e
 cd ~
 if [ ! -d projects/DINOMO ]; then
@@ -380,7 +447,7 @@ echo ""
 echo "  Deploying DINOMO config files..."
 for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH &
-    scp -o StrictHostKeyChecking=no \
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       /dev/stdin ${VM_USER}@${vm_ip}:~/projects/DINOMO/conf/dinomo-base.yml << 'CONFEOF'
 $(cat "${SCRIPT_DIR}/conf/dinomo-base.yml")
 CONFEOF

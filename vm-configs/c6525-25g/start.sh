@@ -5,8 +5,9 @@
 #  proper waits and verification at each step.
 #  Run from repo root: bash vm-configs/c6525-25g/start.sh
 # ============================================================
-
+#!/bin/bash
 set -e
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
@@ -15,37 +16,76 @@ echo " Starting DINOMO on ${CLOUDLAB_HOST}"
 echo "============================================"
 
 # ------------------------------------------------------------
-# Step 1: Kill any leftover processes and delete the pool
+# Step 1: Install dependencies and build DINOMO binaries
 # ------------------------------------------------------------
 echo ""
-echo "[1/6] Cleaning up old processes..."
-# Kill across all VMs in parallel (& ... wait) so cleanup is fast.
-# /dev/shm/pool is the PMDK persistent memory pool on the storage VM. It must be
-# deleted before each run so storage creates it fresh and remote_start_addr is valid.
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+echo "[1/7] Installing dependencies & building DINOMO across nodes..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_STORAGE='${VM_STORAGE}' VM_KVS='${VM_KVS}' VM_ROUTE='${VM_ROUTE}' VM_MONITOR='${VM_MONITOR}' VM_BENCH='${VM_BENCH}' VM_USER='${VM_USER}' DINOMO_DIR='${DINOMO_DIR}' bash -s" << 'ENDSSH'
 for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
-  ssh -o StrictHostKeyChecking=no ${VM_USER}@\${vm_ip} \
-    'sudo pkill -9 -f "dinomo-(storage|kvs|route|monitor|bench)" 2>/dev/null; sudo rm -f /dev/shm/pool; echo "  clean: \$(hostname)"' &
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${VM_USER}@${vm_ip} "
+    # Install build tools and libraries (including jemalloc and protobuf)
+    sudo apt-get update -qq && sudo apt-get install -y -qq \
+      build-essential cmake pkg-config libjemalloc-dev libprotobuf-dev \
+      protobuf-compiler libibverbs-dev librdmacm-dev libgflags-dev \
+      libgoogle-glog-dev libsnappy-dev libboost-all-dev libgrpc++-dev protobuf-compiler-grpc \
+      ibverbs-utils
+
+    cd ${DINOMO_DIR}
+    git submodule update --init --recursive
+
+    # Link dinomo-config.yml on every node
+    # dinomo binary looks for conf/dinomo-config.yml instead of conf/dinomo-base.yml
+    ln -sf dinomo-base.yml conf/dinomo-config.yml 2>/dev/null || true
+
+    # Build libbloom dependency if libbloom.so is missing
+    if [ ! -f src/kvs/libbloom/build/libbloom.so ]; then
+      echo '  Building libbloom dependency...'
+      (cd src/kvs/libbloom && make)
+    fi
+
+    # Build DINOMO if target binary does not exist
+    if [ ! -f ${DINOMO_DIR}/build/target/kvs/dinomo-storage ]; then
+      echo '  Building DINOMO on \$(hostname)...'
+      cd ${DINOMO_DIR}
+      rm -rf build && mkdir -p build && cd build
+      cmake .. && make -j\$(nproc)
+    fi
+  " &
 done
 wait
 ENDSSH
 echo "  Done."
 
 # ------------------------------------------------------------
-# Step 2: Load Soft-RoCE in storage and kvs VMs
+# Step 2: Kill any leftover processes and delete the pool
 # ------------------------------------------------------------
 echo ""
-echo "[2/6] Setting up Soft-RoCE (rdma_rxe)..."
-# rdma_rxe is a kernel module that implements RDMA over a regular Ethernet interface.
-# It is not persistent across VM reboots so it must be loaded every time.
-# We delete any existing rxe0 device first to avoid "device busy" errors on re-runs,
-# then attach a fresh one to VM_RDMA_IFACE (the NIC on the br-rdma bridge).
-# The port state must show ACTIVE before DINOMO can use it.
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+echo "[2/7] Cleaning up old processes..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_STORAGE='${VM_STORAGE}' VM_KVS='${VM_KVS}' VM_ROUTE='${VM_ROUTE}' VM_MONITOR='${VM_MONITOR}' VM_BENCH='${VM_BENCH}' VM_USER='${VM_USER}' bash -s" << 'ENDSSH'
+for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
+  ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} \
+    'sudo pkill -9 -f "dinomo-(storage|kvs|route|monitor|bench)" 2>/dev/null; sudo rm -f /dev/shm/pool; echo "  clean: $(hostname)"' &
+done
+wait
+ENDSSH
+echo "  Done."
+
+# ------------------------------------------------------------
+# Step 3: Load Soft-RoCE in storage and kvs VMs
+# ------------------------------------------------------------
+echo ""
+echo "[3/7] Setting up Soft-RoCE (rdma_rxe)..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_STORAGE='${VM_STORAGE}' VM_KVS='${VM_KVS}' VM_USER='${VM_USER}' VM_RDMA_IFACE='${VM_RDMA_IFACE}' bash -s" << 'ENDSSH'
 for vm_ip in ${VM_STORAGE} ${VM_KVS}; do
-  ssh -o StrictHostKeyChecking=no ${VM_USER}@\${vm_ip} "
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${VM_USER}@${vm_ip} "
+    if ! modinfo rdma_rxe &>/dev/null; then
+      echo '  Installing linux-modules-extra...'
+      sudo apt-get update -qq
+      sudo apt-get install -y -qq linux-modules-extra-\$(uname -r) || \
+        sudo apt-get install -y -qq linux-modules-extra-generic
+    fi
     sudo modprobe rdma_rxe
-    sudo rdma link delete rxe0/1 2>/dev/null || true
+    sudo rdma link delete rxe0 2>/dev/null || true
     sudo rdma link add rxe0 type rxe netdev ${VM_RDMA_IFACE}
     state=\$(rdma link show | grep rxe0 | awk '{print \$4}')
     echo \"  rxe0 on \$(hostname): \${state}\"
@@ -56,13 +96,15 @@ ENDSSH
 echo "  Done."
 
 # ------------------------------------------------------------
-# Step 3: Start storage and wait until it is ready
+# Step 4: Start storage and wait until it is ready
 # ------------------------------------------------------------
 echo ""
-echo "[3/6] Starting dinomo-storage..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+echo "[4/7] Starting dinomo-storage..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_STORAGE='${VM_STORAGE}' VM_USER='${VM_USER}' DINOMO_DIR='${DINOMO_DIR}' bash -s" << 'ENDSSH'
+# In Step 4 before running dinomo-storage:
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_STORAGE} "
   cd ${DINOMO_DIR}
+
   sudo rm -f /dev/shm/pool
   nohup sudo ./build/target/kvs/dinomo-storage > /tmp/dinomo-storage.log 2>&1 < /dev/null &
   echo \"  storage PID: \$!\"
@@ -92,29 +134,26 @@ for i in $(seq 1 30); do
 done
 
 # ------------------------------------------------------------
-# Step 4: Start kvs (must happen after storage is ready)
+# Step 5: Start kvs (must happen after storage is ready)
 # ------------------------------------------------------------
 echo ""
-echo "[4/6] Starting dinomo-kvs..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+echo "[5/7] Starting dinomo-kvs..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_KVS='${VM_KVS}' VM_USER='${VM_USER}' DINOMO_DIR='${DINOMO_DIR}' bash -s" << 'ENDSSH'
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_KVS} "
   cd ${DINOMO_DIR}
-  # < /dev/null prevents nohup from holding the SSH session open waiting for stdin.
   nohup sudo ./build/target/kvs/dinomo-kvs > /tmp/dinomo-kvs.log 2>&1 < /dev/null &
   echo \"  kvs PID: \$!\"
 "
 ENDSSH
 
-# Short wait so kvs can initiate its TCP connection to storage for the Queue Pair
-# handshake before route/monitor/bench start sending ZMQ messages to kvs.
 sleep 3
 
 # ------------------------------------------------------------
-# Step 5: Start route, monitor, bench
+# Step 6: Start route, monitor, bench
 # ------------------------------------------------------------
 echo ""
-echo "[5/6] Starting route, monitor, bench..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+echo "[6/7] Starting route, monitor, bench..."
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_ROUTE='${VM_ROUTE}' VM_MONITOR='${VM_MONITOR}' VM_BENCH='${VM_BENCH}' VM_USER='${VM_USER}' DINOMO_DIR='${DINOMO_DIR}' bash -s" << 'ENDSSH'
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_ROUTE} "
   cd ${DINOMO_DIR}
   nohup ./build/target/kvs/dinomo-route > /tmp/dinomo-route.log 2>&1 < /dev/null &
@@ -134,13 +173,10 @@ wait
 ENDSSH
 
 # ------------------------------------------------------------
-# Step 6: Wait for kvs to complete RDMA handshake (STEP4 x4)
+# Step 7: Wait for kvs to complete RDMA handshake
 # ------------------------------------------------------------
 echo ""
-echo "[6/6] Waiting for kvs RDMA handshake (STEP4 on all 4 threads)..."
-# "raddr_pool=" is printed by each kvs worker thread in dinomo_compute.hpp after it
-# reads the hash table header from storage via RDMA and confirms remote_start_addr
-# matches raddr_pool. Four such lines means all threads completed the handshake.
+echo "[7/7] Waiting for kvs RDMA handshake (STEP4 on all 4 threads)..."
 for i in $(seq 1 30); do
   sleep 2
   step4_count=$($SSH ${SSH_USER}@${CLOUDLAB_HOST} \
@@ -162,7 +198,7 @@ done
 echo ""
 echo "============================================"
 echo " DINOMO is ready."
-echo " Run test:  bash vm-configs/c6525-25g/test.sh"
+echo " Run test:   bash vm-configs/c6525-25g/test.sh"
 echo " Check logs: bash vm-configs/c6525-25g/check_logs.sh"
-echo " Stop:      bash vm-configs/c6525-25g/stop.sh"
+echo " Stop:       bash vm-configs/c6525-25g/stop.sh"
 echo "============================================"

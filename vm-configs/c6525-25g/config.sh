@@ -9,13 +9,19 @@
 # -------------------------------------------------------
 # CHANGE THIS for each new CloudLab experiment
 # -------------------------------------------------------
-CLOUDLAB_HOST="amd225.utah.cloudlab.us"
+CLOUDLAB_HOST="sabro.idav.ucdavis.edu"
 
 # -------------------------------------------------------
 # Change these if your SSH setup is different
 # -------------------------------------------------------
-SSH_USER="Uriel"
-SSH_KEY="${HOME}/.ssh/id_ed25519"
+SSH_USER="lredivo"
+SSH_KEY="${HOME}/.ssh/sabro_ed25519"
+
+# Host sudo password (leave blank to prompt interactively, or set as env var)
+if [ -z "${HOST_SUDO_PASS:-}" ] && [ -t 0 ]; then
+  read -sp "Enter sudo password for ${SSH_USER}@${CLOUDLAB_HOST}: " HOST_SUDO_PASS
+  echo ""
+fi
 
 # -------------------------------------------------------
 # Node type — determines VM interface names and disk path.
@@ -43,11 +49,11 @@ DINOMO_REPO="https://github.com/utsaslab/dinomo.git"  # update to your fork when
 case "$NODE_TYPE" in
   c6525-25g)
     # Network interface inside each VM that carries Soft-RoCE (br-rdma bridge)
-    VM_RDMA_IFACE="enp2s0"
+    VM_RDMA_IFACE="eth1"
     # Where VM disk images are stored on the host
-    HOST_DATA_DIR="/mnt/data"
+    HOST_DATA_DIR="/scr/lredivo"
     # Ubuntu base image filename
-    HOST_BASE_IMAGE="/mnt/data/ubuntu-20.04-base.img"
+    HOST_BASE_IMAGE="/scr/lredivo/ubuntu-20.04-base.img"
     ;;
   *)
     echo "ERROR: Unknown NODE_TYPE '${NODE_TYPE}'. Edit config.sh."

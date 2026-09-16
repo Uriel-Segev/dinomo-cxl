@@ -4,6 +4,7 @@
 #include "client/kvs_client.hpp"
 #include "kvs_threads.hpp"
 #include "yaml-cpp/yaml.h"
+#include "trace_replay.hpp"
 
 unsigned kBenchmarkThreadNum;
 unsigned kBenchmarkNodeNum;
@@ -152,7 +153,7 @@ void run(const unsigned &thread_id,
                 double zipf = stod(v[4]);
 
                 vector<double> sum_probs;
-                sum_probs.reserve(num_keys);
+                sum_probs.resize(static_cast<size_t>(num_keys) + 1);
                 double base;
 
                 if (zipf > 0) {
@@ -215,7 +216,7 @@ void run(const unsigned &thread_id,
                 double zipf = stod(v[4]);
 
                 vector<double> sum_probs;
-                sum_probs.reserve(num_keys);
+                sum_probs.resize(static_cast<size_t>(num_keys) + 1);
                 double base;
 
                 if (zipf > 0) {
@@ -703,7 +704,7 @@ void run(const unsigned &thread_id,
                 auto it = req_ratio_map.begin();
 
                 vector<double> sum_probs;
-                sum_probs.reserve(num_keys);
+                sum_probs.resize(static_cast<size_t>(num_keys) + 1);
                 double base;
 
                 if (zipf > 0) {
@@ -929,7 +930,7 @@ void run(const unsigned &thread_id,
                 auto it = req_ratio_map.begin();
 
                 vector<double> sum_probs;
-                sum_probs.reserve(num_keys);
+                sum_probs.resize(static_cast<size_t>(num_keys) + 1);
                 double base;
 
                 if (zipf > 0) {
@@ -1129,6 +1130,81 @@ void run(const unsigned &thread_id,
                             &pushers[thread.feedback_report_connect_address()]);
                 }
 #endif
+            } else if (mode == "TRACE") {
+#ifdef SINGLE_OUTSTANDING
+                log->error("TRACE_ERROR: TRACE requires the default multiple-outstanding build.");
+#else
+                try {
+                    if (v.size() != 7 && v.size() != 8)
+                        throw std::runtime_error("expected TRACE:path:num_keys:value_size:report_period:outstanding:seed[:drain_timeout_s]");
+                    const unsigned keys = dinomo_trace::integer(v[2], "num_keys");
+                    const unsigned length = dinomo_trace::integer(v[3], "value_size");
+                    const unsigned period = dinomo_trace::integer(v[4], "report_period");
+                    const unsigned outstanding = dinomo_trace::integer(v[5], "outstanding");
+                    const unsigned trace_seed = dinomo_trace::integer(v[6], "seed", true);
+                    const unsigned drain_timeout = v.size() == 8 ?
+                        dinomo_trace::integer(v[7], "drain_timeout_s") : 30;
+                    const auto phases = dinomo_trace::load(v[1], keys);
+                    unsigned ts = generate_timestamp(thread_id);
+                    LWWPairLattice<string> val(TimestampValuePair<string>(ts, string(length, 'a')));
+                    const string value = serialize(val);
+                    struct TraceClient {
+                        KvsClient &native;
+                        const string &value;
+                        string issue(bool read, unsigned key) {
+                            return read ? native.get_async_with_id(generate_key(key)) :
+                                native.update_async(generate_key(key), value, LatticeType::LWW);
+                        }
+                        std::vector<dinomo_trace::Response> receive() {
+                            double ignored_latency = 0;
+                            std::vector<dinomo_trace::Response> result;
+                            for (const auto &response : native.receive_async2(ignored_latency)) {
+                                bool success = response.error() == AnnaError::NO_ERROR && response.tuples_size() == 1;
+                                if (success) success = response.tuples(0).error() == AnnaError::NO_ERROR;
+                                result.push_back({response.response_id(), success});
+                            }
+                            return result;
+                        }
+                        bool pending_done() { return native.check_all_pending_requests_done(); }
+                    } trace_client{client, value};
+                    auto emit = [&](const string &json) { log->info("TRACE_RECORD {}", json); };
+                    auto report = [&](double throughput, double avg, double min, double max, double median, double tail,
+                                      const dinomo_trace::KeyLatencies &key_latencies) {
+                        UserFeedback feedback;
+                        feedback.set_uid(ip + ":" + std::to_string(thread_id));
+                        feedback.set_throughput(throughput);
+                        feedback.set_avg_latency(avg);
+                        feedback.set_min_latency(min);
+                        feedback.set_max_latency(max);
+                        feedback.set_median_latency(median);
+                        feedback.set_tail_latency(tail);
+                        for (const auto &entry : key_latencies) {
+                            const double latency = entry.second.first / entry.second.second;
+                            if (latency > 1) {
+                                auto *kl = feedback.add_key_latency();
+                                kl->set_key(generate_key(entry.first));
+                                kl->set_latency(latency);
+                            }
+                        }
+                        string serialized;
+                        feedback.SerializeToString(&serialized);
+                        for (const MonitoringThread &thread : monitoring_threads)
+                            kZmqUtil->send_string(serialized, &pushers[thread.feedback_report_connect_address()]);
+                    };
+                    const bool pass = dinomo_trace::replay(trace_client, phases, keys, period,
+                            outstanding, trace_seed, drain_timeout, emit, report);
+                    log->info("TRACE_DONE status={}", pass ? "PASS" : "FAIL");
+                    UserFeedback feedback;
+                    feedback.set_uid(ip + ":" + std::to_string(thread_id));
+                    feedback.set_finish(true);
+                    string serialized;
+                    feedback.SerializeToString(&serialized);
+                    for (const MonitoringThread &thread : monitoring_threads)
+                        kZmqUtil->send_string(serialized, &pushers[thread.feedback_report_connect_address()]);
+                } catch (const std::exception &e) {
+                    log->error("TRACE_ERROR: {}", e.what());
+                }
+#endif
             } else if (mode == "RMW") {
             } else if (mode == "RLW") {
             } else if (mode == "LOAD") {
@@ -1251,6 +1327,15 @@ void run(const unsigned &thread_id,
 }
 
 int main(int argc, char *argv[]) {
+    // Capability probe runs without reading configuration or starting clients.
+    if (argc == 2 && string(argv[1]) == "--supports-trace") {
+#ifdef SINGLE_OUTSTANDING
+        return 1;
+#else
+        std::cout << "dinomo-trace-v1" << std::endl;
+        return 0;
+#endif
+    }
     if (argc != 1) {
         std::cerr << "Usage: " << argv[0] << std::endl;
         return 1;

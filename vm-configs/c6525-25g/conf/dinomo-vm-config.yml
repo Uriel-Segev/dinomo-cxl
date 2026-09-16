@@ -1,6 +1,6 @@
 storage: /storage
 capacities: # in MB
-  memory-cap: 8192
+  memory-cap: 256
   storage-cap: 8192
 threads:
   memory: 4
@@ -64,3 +64,23 @@ routing:
 monitoring:
     mgmt_ip: 192.168.122.114
     ip: 192.168.122.114
+server:
+    seed_ip: 192.168.122.99
+    public_ip: 192.168.122.150
+    private_ip: 192.168.122.150
+    mgmt_ip: "NULL"
+    monitoring:
+        - 192.168.122.114
+    routing:
+        - 192.168.122.99
+user:
+    ip: 192.168.122.167
+    monitoring:
+        - 192.168.122.114
+    routing:
+        - 192.168.122.99
+trigger:
+    benchmark:
+        - 192.168.122.167
+    management:
+        - 192.168.122.99

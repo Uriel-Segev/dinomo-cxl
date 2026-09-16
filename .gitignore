@@ -11,3 +11,6 @@ common/scripts/protobuf*
 vm-configs/c6220/
 vm-configs/d6515/
 vm-configs/r6525/
+
+# Local benchmark output
+results/

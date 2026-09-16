@@ -28,11 +28,62 @@ echo "This will take 15-30 minutes. Do not interrupt."
 echo ""
 
 # -------------------------------------------------------
-# Phase 1: Prepare the host (install KVM, create networks)
+# Phase 1: Prepare the host (data disk, KVM, and networks)
 # -------------------------------------------------------
 echo "[Phase 1/4] Preparing host..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << 'ENDSSH'
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} bash -s -- "${HOST_DATA_DIR}" "${HOST_DATA_DEVICE}" << 'ENDSSH'
 set -e
+
+DATA_DIR="$1"
+DATA_DEVICE="$2"
+
+# Fresh CloudLab c6525-25g nodes expose /dev/sdb as an unformatted scratch
+# disk. Keep VM images off the small root partition. Existing filesystems are
+# preserved; a disk with partitions is rejected instead of being overwritten.
+echo "  Preparing VM data disk ${DATA_DEVICE} at ${DATA_DIR}..."
+if [ ! -b "${DATA_DEVICE}" ]; then
+  echo "ERROR: configured data device ${DATA_DEVICE} does not exist."
+  exit 1
+fi
+
+mounted_at=$(findmnt -rn -S "${DATA_DEVICE}" -o TARGET | head -n 1 || true)
+if [ -n "${mounted_at}" ] && [ "${mounted_at}" != "${DATA_DIR}" ]; then
+  echo "ERROR: ${DATA_DEVICE} is already mounted at ${mounted_at}, not ${DATA_DIR}."
+  exit 1
+fi
+if mountpoint -q "${DATA_DIR}"; then
+  mounted_source=$(findmnt -rn -M "${DATA_DIR}" -o SOURCE)
+  if [ "${mounted_source}" != "${DATA_DEVICE}" ]; then
+    echo "ERROR: ${DATA_DIR} is already mounted from ${mounted_source}, not ${DATA_DEVICE}."
+    exit 1
+  fi
+fi
+
+if ! sudo blkid "${DATA_DEVICE}" >/dev/null 2>&1; then
+  if [ "$(lsblk -nr -o TYPE "${DATA_DEVICE}" | wc -l)" -ne 1 ]; then
+    echo "ERROR: ${DATA_DEVICE} has partitions but no filesystem on the whole disk."
+    echo "Set HOST_DATA_DEVICE to the intended formatted partition."
+    exit 1
+  fi
+  echo "  Creating ext4 filesystem on empty scratch disk ${DATA_DEVICE}..."
+  sudo mkfs.ext4 -F "${DATA_DEVICE}" >/dev/null
+fi
+data_fstype=$(sudo blkid -s TYPE -o value "${DATA_DEVICE}")
+if [ -z "${data_fstype}" ]; then
+  echo "ERROR: unable to determine the filesystem type on ${DATA_DEVICE}."
+  exit 1
+fi
+
+sudo mkdir -p "${DATA_DIR}"
+if ! mountpoint -q "${DATA_DIR}"; then
+  sudo mount "${DATA_DEVICE}" "${DATA_DIR}"
+fi
+data_uuid=$(sudo blkid -s UUID -o value "${DATA_DEVICE}")
+if ! awk -v target="${DATA_DIR}" \
+  '$1 !~ /^#/ && $2 == target { found=1 } END { exit !found }' /etc/fstab; then
+  echo "UUID=${data_uuid} ${DATA_DIR} ${data_fstype} defaults,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+fi
+sudo chown "$(id -u):$(id -g)" "${DATA_DIR}"
 
 echo "  Installing KVM and libvirt..."
 sudo apt-get update -qq
@@ -44,17 +95,37 @@ sudo apt-get install -y -qq \
 # Ensure libvirt service is running
 sudo systemctl enable --now libvirtd
 
+# This key is used only for the host-to-VM SSH hop. cloud-init installs its
+# public half in every VM below.
+if [ ! -f ~/.ssh/id_ed25519 ]; then
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+fi
+
+# Ubuntu normally ships the default NAT network with libvirt, but ensure it is
+# defined and active before assigning the VMs their management interfaces.
+if ! sudo virsh net-info default >/dev/null 2>&1; then
+  sudo virsh net-define /usr/share/libvirt/networks/default.xml
+fi
+sudo virsh net-autostart default >/dev/null
+if ! sudo virsh net-info default | grep -q 'Active:.*yes'; then
+  sudo virsh net-start default >/dev/null
+fi
+
 # br-rdma is a separate Linux bridge from the default libvirt NAT bridge (virbr0).
 # We use a dedicated bridge so RDMA traffic stays on its own subnet (10.0.0.x) and
 # Soft-RoCE (rdma_rxe) can attach to a single predictable interface inside each VM.
 echo "  Creating br-rdma bridge for RDMA traffic..."
 if ! sudo ip link show br-rdma &>/dev/null; then
   sudo ip link add name br-rdma type bridge
-  sudo ip link set br-rdma up
-  sudo ip addr add 10.0.0.254/24 dev br-rdma
   echo "  br-rdma created"
 else
   echo "  br-rdma already exists"
+fi
+sudo ip link set br-rdma up
+if ! ip -4 address show dev br-rdma | grep -q '10\.0\.0\.254/24'; then
+  sudo ip addr add 10.0.0.254/24 dev br-rdma
 fi
 
 # Make br-rdma persistent across reboots
@@ -103,11 +174,15 @@ set -e
 DATA="${HOST_DATA_DIR}"
 BASE="${HOST_BASE_IMAGE}"
 
-# Download Ubuntu 20.04 cloud image if not present
-if [ ! -f "\${BASE}" ]; then
+# Download Ubuntu 20.04 cloud image if not present or invalid. Download to a
+# temporary name so an interrupted transfer is never mistaken for a valid base.
+if [ ! -f "\${BASE}" ] || ! sudo qemu-img info "\${BASE}" >/dev/null 2>&1; then
   echo "  Downloading Ubuntu 20.04 cloud image (~600MB)..."
-  sudo wget -q -O "\${BASE}" \
+  sudo rm -f "\${BASE}.download"
+  sudo wget -q -O "\${BASE}.download" \
     https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+  sudo qemu-img info "\${BASE}.download" >/dev/null
+  sudo mv "\${BASE}.download" "\${BASE}"
   echo "  Download done."
 else
   echo "  Base image already exists."
@@ -186,7 +261,8 @@ runcmd:
   - netplan apply
   - sleep 5
   - apt-get update
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git python3 libibverbs-dev librdmacm-dev rdma-core libtbb-dev libzmq3-dev libboost-all-dev libyaml-cpp-dev libpmemobj-dev libpmem-dev numactl wget
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential autoconf automake libtool pkg-config cmake git python3 libibverbs-dev librdmacm-dev rdma-core libtbb-dev libzmq3-dev libboost-all-dev libyaml-cpp-dev libpmemobj-dev libpmem-dev numactl wget
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y protobuf-compiler libprotobuf-dev libjemalloc-dev pciutils linux-modules-extra-generic
   - echo "cloud-init done" > /tmp/cloud-init-done
 USERDATA
 
@@ -237,10 +313,8 @@ NETCFG
     --memory \${ram} \
     --disk path=\${DATA}/dinomo-\${name}.qcow2,format=qcow2 \
     --disk path=/tmp/seed-\${name}.iso,device=cdrom \
-    --network network=default,model=virtio \
-    --mac \${mgmt_mac} \
+    --network network=default,model=virtio,mac=\${mgmt_mac} \
     \${EXTRA_NIC} \
-    --os-type linux \
     --os-variant ubuntu20.04 \
     --import \
     --noautoconsole \
@@ -263,6 +337,7 @@ create_vm monitor 4  8192  ${VM_MONITOR} ""
 create_vm bench   4  16384 ${VM_BENCH}   ""
 
 echo "  Waiting for all VMs to finish booting and cloud-init (~5 min)..."
+all_ready=1
 for name in storage kvs route monitor bench; do
   echo -n "  Waiting for dinomo-\${name}"
   for i in \$(seq 1 60); do
@@ -282,9 +357,15 @@ for name in storage kvs route monitor bench; do
     echo -n "."
     if [ \$i -eq 60 ]; then
       echo " TIMEOUT. Check: sudo virsh console dinomo-\${name}"
+      all_ready=0
     fi
   done
 done
+
+if [ "\${all_ready}" -ne 1 ]; then
+  echo "ERROR: one or more VMs did not finish cloud-init."
+  exit 1
+fi
 
 echo "  Phase 3 done."
 ENDSSH
@@ -306,16 +387,27 @@ cd ~
 if [ ! -d projects/DINOMO ]; then
   mkdir -p projects
   cd projects
-  git clone ${DINOMO_REPO} DINOMO
+  git clone --branch ${DINOMO_BRANCH} --single-branch ${DINOMO_REPO} DINOMO
   cd DINOMO
 else
   cd projects/DINOMO
-  git pull
+  git remote set-url origin ${DINOMO_REPO}
+  git fetch origin ${DINOMO_BRANCH}
+  git checkout ${DINOMO_BRANCH}
+  git pull --ff-only origin ${DINOMO_BRANCH}
 fi
 
 # -mavx2 is in the original CMakeLists.txt but CloudLab VMs don't always expose AVX2
 # to guests even if the host supports it, causing an illegal instruction crash at startup.
 sed -i 's/-mavx2//g' CMakeLists.txt
+
+# Keep the header-only logging dependency reproducible and include the header
+# that declares basic_logger_mt in spdlog 1.x. These edits are idempotent and
+# also cover installations made before the corresponding source change is pushed.
+sed -i 's/GIT_TAG "master"/GIT_TAG "v1.10.0"/' common/vendor/spdlog/CMakeLists.txt
+if ! grep -q 'spdlog/sinks/basic_file_sink.h' common/include/types.hpp; then
+  sed -i '/#include "spdlog\/spdlog.h"/a #include "spdlog/sinks/basic_file_sink.h"' common/include/types.hpp
+fi
 
 # PMDK TLS crash fix: server_manager_thread calls pmemobj_zalloc() on demand, but PMDK 1.8
 # doesn't initialize its thread-local storage in that thread — it only initializes TLS in the
@@ -323,7 +415,7 @@ sed -i 's/-mavx2//g' CMakeLists.txt
 # it dereferences a NULL TLS pointer (NULL+0x1808) and crashes ~40s into a benchmark run.
 # Fix: pre-allocate 32 spare log blocks from the main thread into reserved_alloc_queue before
 # any worker threads start, so server_manager_thread never needs to call pmemobj_zalloc.
-if ! grep -q "Pre-allocate spare log blocks" src/kvs/dinomo_storage.cpp; then
+if ! grep -q "Pre-allocated %d spare log blocks" src/kvs/dinomo_storage.cpp; then
   python3 - << 'PYFIX'
 import re
 
@@ -371,30 +463,52 @@ fi
 
 # Build bundled libbloom first
 cd src/kvs/libbloom
-make -j$(nproc)
+make -j\$(nproc)
 cd ../../..
 
 # Build DINOMO
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release > /tmp/cmake.log 2>&1
-make -j$(nproc) > /tmp/make.log 2>&1
-echo "Build complete on $(hostname)"
+make -j\$(nproc) > /tmp/make.log 2>&1
+echo "Build complete on \$(hostname)"
 VMSSH
 ENDSSH
   echo "  Done: ${vm_name}"
 }
 
-# Build in parallel on all 5 VMs
-build_on_vm "${VM_STORAGE}" "storage" &
-build_on_vm "${VM_KVS}"     "kvs"     &
-build_on_vm "${VM_ROUTE}"   "route"   &
-build_on_vm "${VM_MONITOR}" "monitor" &
-build_on_vm "${VM_BENCH}"   "bench"   &
-wait
+# Build in parallel on all 5 VMs and preserve each failure status.
+build_pids=()
+build_names=()
+for vm_spec in \
+  "${VM_STORAGE}:storage" \
+  "${VM_KVS}:kvs" \
+  "${VM_ROUTE}:route" \
+  "${VM_MONITOR}:monitor" \
+  "${VM_BENCH}:bench"
+do
+  vm_ip="${vm_spec%%:*}"
+  vm_name="${vm_spec#*:}"
+  build_on_vm "${vm_ip}" "${vm_name}" &
+  build_pids+=("$!")
+  build_names+=("${vm_name}")
+done
+
+build_failed=0
+for i in "${!build_pids[@]}"; do
+  if ! wait "${build_pids[$i]}"; then
+    echo "ERROR: build failed on ${build_names[$i]}."
+    build_failed=1
+  fi
+done
+if [ "${build_failed}" -ne 0 ]; then
+  exit 1
+fi
 
 # Copy config files to each VM
 echo ""
 echo "  Deploying DINOMO config files..."
+deploy_pids=()
+deploy_ips=()
 for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH &
     ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} \
@@ -405,9 +519,25 @@ CONFEOF
       "cat > ~/projects/DINOMO/conf/dinomo-vm-config.yml" << 'CONFEOF'
 $(cat "${SCRIPT_DIR}/conf/dinomo-vm-config.yml")
 CONFEOF
+    ssh -o StrictHostKeyChecking=no ${VM_USER}@${vm_ip} \
+      "cat > ~/projects/DINOMO/conf/dinomo-config.yml" << 'CONFEOF'
+$(cat "${SCRIPT_DIR}/conf/dinomo-vm-config.yml")
+CONFEOF
 ENDSSH
+  deploy_pids+=("$!")
+  deploy_ips+=("${vm_ip}")
 done
-wait
+
+deploy_failed=0
+for i in "${!deploy_pids[@]}"; do
+  if ! wait "${deploy_pids[$i]}"; then
+    echo "ERROR: config deployment failed on ${deploy_ips[$i]}."
+    deploy_failed=1
+  fi
+done
+if [ "${deploy_failed}" -ne 0 ]; then
+  exit 1
+fi
 
 echo "  Phase 4 done."
 

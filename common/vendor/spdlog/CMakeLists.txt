@@ -4,7 +4,7 @@ INCLUDE(ExternalProject)
 
 EXTERNALPROJECT_ADD(spdlog
     GIT_REPOSITORY "https://github.com/gabime/spdlog"
-    GIT_TAG "master"
+    GIT_TAG "v1.10.0"
     BUILD_IN_SOURCE 1
     UPDATE_COMMAND ""
     CONFIGURE_COMMAND ""
@@ -14,4 +14,3 @@ EXTERNALPROJECT_ADD(spdlog
 
 SET(SPDLOG_INCLUDE_DIRS
     ${CMAKE_CURRENT_BINARY_DIR}/spdlog-prefix/src/spdlog/include PARENT_SCOPE)
-

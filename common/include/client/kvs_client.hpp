@@ -141,11 +141,18 @@ class KvsClient : public KvsClientInterface {
   }
 #else
   void get_async(const Key& key) {
+      get_async_with_id(key);
+  }
+
+  // Preserve the existing void API; expose request identity for trace latency
+  // accounting without changing the request format or retry path.
+  string get_async_with_id(const Key& key) {
       KeyRequest request;
       prepare_data_request(request, key);
       request.set_type(RequestType::GET);
 
       try_request(request);
+      return request.request_id();
   }
 #endif
 

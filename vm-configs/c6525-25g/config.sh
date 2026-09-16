@@ -9,7 +9,7 @@
 # -------------------------------------------------------
 # CHANGE THIS for each new CloudLab experiment
 # -------------------------------------------------------
-CLOUDLAB_HOST="amd136.utah.cloudlab.us"
+CLOUDLAB_HOST="dinomo-host.vinothg-315218.davissystems-pg0.utah.cloudlab.us"
 
 # -------------------------------------------------------
 # Change these if your SSH setup is different
@@ -35,7 +35,8 @@ VM_MONITOR="192.168.122.114"
 VM_BENCH="192.168.122.167"
 VM_USER="ubuntu"
 DINOMO_DIR="~/projects/DINOMO"
-DINOMO_REPO="https://github.com/Uriel-Segev/dinomo-cxl.git"  # update to your fork when ready
+DINOMO_REPO="https://github.com/Uriel-Segev/dinomo-cxl.git"
+DINOMO_BRANCH="cloudlab-softroce"
 
 # -------------------------------------------------------
 # Node-type-specific settings
@@ -44,10 +45,14 @@ case "$NODE_TYPE" in
   c6525-25g)
     # Network interface inside each VM that carries Soft-RoCE (br-rdma bridge)
     VM_RDMA_IFACE="enp2s0"
-    # Where VM disk images are stored on the host
+    # Fresh c6525-25g nodes expose an empty secondary disk as /dev/sdb.
+    # setup_vms.sh formats it only when it has no filesystem or partitions,
+    # then mounts it at HOST_DATA_DIR.
+    HOST_DATA_DEVICE="/dev/sdb"
+    # Where VM disk images are stored on the host.
     HOST_DATA_DIR="/mnt/data"
     # Ubuntu base image filename
-    HOST_BASE_IMAGE="/mnt/data/ubuntu-20.04-base.img"
+    HOST_BASE_IMAGE="${HOST_DATA_DIR}/ubuntu-20.04-base.img"
     ;;
   *)
     echo "ERROR: Unknown NODE_TYPE '${NODE_TYPE}'. Edit config.sh."
@@ -67,4 +72,4 @@ BENCH_OUTSTANDING=64     # max outstanding requests
 # -------------------------------------------------------
 # SSH command shorthand — used by all scripts
 # -------------------------------------------------------
-SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o BatchMode=yes"
+SSH="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o BatchMode=yes"

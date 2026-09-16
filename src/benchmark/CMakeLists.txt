@@ -11,3 +11,5 @@ ADD_EXECUTABLE(dinomo-bench-trigger trigger.cpp)
 TARGET_LINK_LIBRARIES(dinomo-bench-trigger anna-hash-ring ${KV_LIBRARY_DEPENDENCIES}
   anna-bench-proto)
 ADD_DEPENDENCIES(dinomo-bench-trigger anna-hash-ring zeromq zeromqcpp)
+
+ADD_EXECUTABLE(dinomo-trace-check trace_check.cpp)

@@ -40,13 +40,15 @@ case "$MODE" in
 esac
 
 echo "Sending: ${CMD}"
+TRIGGER_TIMEOUT=$(( WAIT - 1 ))
 $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} "
   cd ${DINOMO_DIR}
-  # bench-trigger reads a command from stdin and sends it over ZMQ, then exits when stdin closes.
-  # The problem is it segfaults immediately when stdin closes before ZMQ finishes delivering.
-  # The fix: pipe (echo CMD; sleep N) so stdin stays open for N seconds after the echo.
-  (echo '${CMD}'; sleep ${WAIT}) | ./build/target/benchmark/dinomo-bench-trigger 1
+  # Keep stdin open for ZMQ delivery and terminate the helper before EOF makes
+  # it loop forever. dinomo-bench continues the workload independently.
+  (printf '%s\\n' '${CMD}'; sleep ${WAIT}) | \
+    timeout ${TRIGGER_TIMEOUT}s ./build/target/benchmark/dinomo-bench-trigger 1 \
+    >/dev/null 2>&1
 " 2>/dev/null || true
 ENDSSH
 echo "Done. Results: ssh ${SSH_USER}@${CLOUDLAB_HOST} 'ssh ${VM_USER}@${VM_BENCH} tail -30 ~/projects/DINOMO/log_0.txt'"

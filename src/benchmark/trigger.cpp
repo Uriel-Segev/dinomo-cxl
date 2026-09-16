@@ -67,7 +67,7 @@ int main(int argc, char *argv[]) {
 
     string command;
     while (true) {
-        std::cout << "mode: WARM, RUN, LOAD, ADD, REMOVE" << std::endl;
+        std::cout << "mode: WARM, RUN, TRACE, LOAD, ADD, REMOVE" << std::endl;
         std::cout << "WARM:num_keys:value_length(bytes):num_requests:zipf(if == 0, uniform)" << std::endl;
 #ifdef SINGLE_OUTSTANDING
         std::cout << "WARM-RUN:read_ratio:value_length(bytes):report_period(seconds):elapsed_running_time" << std::endl;
@@ -76,12 +76,14 @@ int main(int argc, char *argv[]) {
         std::cout << "WARM-RUN:read_ratio:value_length(bytes):report_period(seconds):elapsed_running_time:num_outstanding:num_loaded_keys:is_update_only" << std::endl;
         std::cout << "RUN:read_ratio:num_keys:value_length(bytes):report_period(seconds):elapsed_running_time:zipf(if == 0, uniform):num_outstanding:is_update_only" << std::endl;
 #endif
+        std::cout << "TRACE:csv_path:num_keys:value_length(bytes):report_period(seconds):num_outstanding:seed[:drain_timeout_s]" << std::endl;
         std::cout << "LOAD:num_keys:value_length(bytes):total_threads_per_node:num_nodes" << std::endl;
         std::cout << "ADD:num_bench_nodes" << std::endl;
         std::cout << "REMOVE:num_bench_nodes" << std::endl;
         std::cout << "FAIL:num_failed_nodes" << std::endl;
         std::cout << "command> ";
-        getline(std::cin, command);
+        if (!getline(std::cin, command)) break;
+        if (command.empty()) continue;
 
         vector<string> v;
         split(command, ':', v);

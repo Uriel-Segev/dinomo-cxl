@@ -17,12 +17,16 @@ WAIT_AFTER_TRIGGER=$(( BENCH_DURATION + BENCH_REPORT_PERIOD + 5 ))
 send_bench_cmd() {
   local cmd="$1"
   local wait_sec="$2"
+  local trigger_timeout=$(( wait_sec - 1 ))
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} "
   cd ${DINOMO_DIR}
-  # bench-trigger segfaults when stdin closes before ZMQ delivers the message.
-  # Keep stdin open for wait_sec seconds by piping (echo; sleep) instead of just echo.
-  (echo '${cmd}'; sleep ${wait_sec}) | ./build/target/benchmark/dinomo-bench-trigger 1
+  # bench-trigger loops forever after stdin reaches EOF. Keep the pipe open for
+  # the requested wait and stop the helper just before it closes. The benchmark
+  # process continues independently and writes results to log_0.txt.
+  (printf '%s\\n' '${cmd}'; sleep ${wait_sec}) | \
+    timeout ${trigger_timeout}s ./build/target/benchmark/dinomo-bench-trigger 1 \
+    >/dev/null 2>&1
 " 2>/dev/null || true
 ENDSSH
 }

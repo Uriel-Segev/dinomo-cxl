@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/config.sh"
 echo "Starting dinomo-bench on ${VM_BENCH}..."
 $SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} "
+  sudo hostnamectl set-hostname bench0
   cd ${DINOMO_DIR}
   pkill -x dinomo-bench 2>/dev/null || true
   sleep 1
@@ -15,7 +16,7 @@ ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} "
   # Send workload commands with 07_trigger_bench.sh after bench is running.
   # Results go to ~/projects/DINOMO/log_0.txt (not /tmp/dinomo-bench.log).
   nohup ./build/target/benchmark/dinomo-bench > /tmp/dinomo-bench.log 2>&1 < /dev/null &
-  echo \"  bench PID: \$!\"
+  echo \"  bench launch requested\"
 "
 ENDSSH
 echo "When ready, trigger with: bash vm-configs/c6525-25g/07_trigger_bench.sh LOAD"

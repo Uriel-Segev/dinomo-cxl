@@ -12,7 +12,7 @@ ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_ROUTE} "
   pkill -x dinomo-route 2>/dev/null || true
   sleep 1
   nohup ./build/target/kvs/dinomo-route > /tmp/dinomo-route.log 2>&1 < /dev/null &
-  echo \"  route PID: \$!\"
+  echo \"  route launch requested\"
 "
 ENDSSH
 echo "Check log: bash vm-configs/c6525-25g/check_logs.sh"

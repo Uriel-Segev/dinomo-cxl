@@ -1,0 +1,6 @@
+phase,duration_s,read_ratio,hot_start,hot_count,hot_probability
+baseline,30,0.95,1,100000,0.00
+hotspot_A,60,0.95,1,10000,0.90
+hotspot_B,60,0.95,500001,10000,0.90
+write_heavy,30,0.50,500001,10000,0.90
+recovery,60,0.95,1,100000,0.00

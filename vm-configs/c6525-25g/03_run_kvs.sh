@@ -16,7 +16,7 @@ ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_KVS} "
   # at startup for the Queue Pair handshake; if storage isn't listening yet, kvs fails.
   # sudo is required for ibv_reg_mr() on Soft-RoCE (same as storage).
   nohup sudo ./build/target/kvs/dinomo-kvs > /tmp/dinomo-kvs.log 2>&1 < /dev/null &
-  echo \"  kvs PID: \$!\"
+  echo \"  kvs launch requested\"
 "
 ENDSSH
 echo "Check log: bash vm-configs/c6525-25g/check_logs.sh"

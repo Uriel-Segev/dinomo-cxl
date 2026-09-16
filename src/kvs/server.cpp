@@ -1004,11 +1004,46 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
                 stat.set_epoch(epoch);
                 stat.set_access_count(access_count);
                 if (kSelfTier == Tier::MEMORY) {
-                    stat.set_value_cache_size(kvs_->value_cache_size());
-                    stat.set_value_cache_hit_count(kvs_->value_cache_hit_counter());
-                    stat.set_shortcut_cache_hit_count(kvs_->shortcut_cache_hit_counter());
-                    stat.set_local_log_hit_count(kvs_->local_log_hit_counter());
-                    stat.set_cache_miss_count(kvs_->cache_miss_counter());
+                    // Emit machine-readable interval counters for benchmark collection.
+                    // Each accessor returns and resets its counter, so call each exactly once.
+                    const uint64_t value_cache_size = kvs_->value_cache_size();
+                    const uint64_t value_cache_hits = kvs_->value_cache_hit_counter();
+                    const uint64_t shortcut_cache_hits = kvs_->shortcut_cache_hit_counter();
+                    const uint64_t local_log_hits = kvs_->local_log_hit_counter();
+                    const uint64_t cache_misses = kvs_->cache_miss_counter();
+                    stat.set_value_cache_size(value_cache_size);
+                    stat.set_value_cache_hit_count(value_cache_hits);
+                    stat.set_shortcut_cache_hit_count(shortcut_cache_hits);
+                    stat.set_local_log_hit_count(local_log_hits);
+                    stat.set_cache_miss_count(cache_misses);
+                    log->info(
+                        "CACHE_STATS thread={} epoch={} interval_seconds={} "
+                        "value_cache_size={} value_cache_hits={} "
+                        "shortcut_cache_hits={} local_log_hits={} cache_misses={}",
+                        wt.tid(), epoch, duration, value_cache_size,
+                        value_cache_hits, shortcut_cache_hits, local_log_hits,
+                        cache_misses);
+                    const uint64_t rdma_read_ops = kvs_->rdma_read_counter();
+                    const uint64_t rdma_read_bytes = kvs_->rdma_read_payload();
+                    const uint64_t rdma_write_ops = kvs_->rdma_write_counter();
+                    const uint64_t rdma_write_bytes = kvs_->rdma_write_payload();
+                    const uint64_t rdma_send_ops = kvs_->rdma_send_counter();
+                    const uint64_t rdma_send_bytes = kvs_->rdma_send_payload();
+                    const uint64_t rdma_recv_ops = kvs_->rdma_recv_counter();
+                    const uint64_t rdma_recv_bytes = kvs_->rdma_recv_payload();
+                    const uint64_t rdma_cas_ops = kvs_->rdma_cas_counter();
+                    const uint64_t rdma_cas_bytes = kvs_->rdma_cas_payload();
+                    const uint64_t rdma_faa_ops = kvs_->rdma_faa_counter();
+                    const uint64_t rdma_faa_bytes = kvs_->rdma_faa_payload();
+                    log->info(
+                        "RDMA_STATS thread={} epoch={} interval_seconds={} "
+                        "read_ops={} read_bytes={} write_ops={} write_bytes={} "
+                        "send_ops={} send_bytes={} recv_ops={} recv_bytes={} "
+                        "cas_ops={} cas_bytes={} faa_ops={} faa_bytes={}",
+                        wt.tid(), epoch, duration, rdma_read_ops, rdma_read_bytes,
+                        rdma_write_ops, rdma_write_bytes, rdma_send_ops,
+                        rdma_send_bytes, rdma_recv_ops, rdma_recv_bytes,
+                        rdma_cas_ops, rdma_cas_bytes, rdma_faa_ops, rdma_faa_bytes);
                     stat.set_kvs_avg_latency((double)((double)working_time_map[3] / (double)access_count));
                     //stat.set_num_working(num_working_user_req);
                     //stat.set_num_idle(num_idle_user_req);

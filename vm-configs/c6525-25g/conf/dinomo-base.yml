@@ -1,6 +1,6 @@
 storage: /storage
 capacities: # in MB
-  memory-cap: 8192
+  memory-cap: 256
   storage-cap: 8192
 threads:
   memory: 4

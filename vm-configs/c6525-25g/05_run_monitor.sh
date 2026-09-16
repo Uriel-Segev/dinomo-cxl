@@ -12,7 +12,7 @@ ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_MONITOR} "
   pkill -x dinomo-monitor 2>/dev/null || true
   sleep 1
   nohup ./build/target/kvs/dinomo-monitor > /tmp/dinomo-monitor.log 2>&1 < /dev/null &
-  echo \"  monitor PID: \$!\"
+  echo \"  monitor launch requested\"
 "
 ENDSSH
 echo "Check log: bash vm-configs/c6525-25g/check_logs.sh"

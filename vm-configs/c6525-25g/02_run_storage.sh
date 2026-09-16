@@ -16,7 +16,7 @@ ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_STORAGE} "
   # sudo is required: storage calls ibv_reg_mr() which needs CAP_NET_ADMIN on Soft-RoCE.
   # < /dev/null detaches stdin so the SSH session doesn't hang waiting for input.
   nohup sudo ./build/target/kvs/dinomo-storage > /tmp/dinomo-storage.log 2>&1 < /dev/null &
-  echo \"  storage PID: \$!\"
+  echo \"  storage launch requested\"
 "
 ENDSSH
 echo "Check log: bash vm-configs/c6525-25g/check_logs.sh"

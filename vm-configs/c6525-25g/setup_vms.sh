@@ -104,6 +104,36 @@ else
   echo "  rdma-net already defined"
 fi
 
+# Allow VM-to-VM traffic across br-rdma through the host firewall.
+# With br_netfilter loaded (Docker loads it), bridged frames traverse the host's
+# iptables FORWARD chain, whose DROP policy (set by Docker) silently drops the
+# kvs -> storage TCP handshake on 10.0.0.1:1 even though ping gets through.
+# Installed as a systemd unit ordered after docker so it is re-applied on reboot.
+echo "  Allowing br-rdma forwarding in host firewall..."
+sudo tee /usr/local/sbin/dinomo-br-rdma-forward.sh > /dev/null << 'FWSCRIPT'
+#!/bin/sh
+iptables -C FORWARD -i br-rdma -o br-rdma -j ACCEPT 2>/dev/null || \
+  iptables -I FORWARD 1 -i br-rdma -o br-rdma -j ACCEPT
+FWSCRIPT
+sudo chmod 755 /usr/local/sbin/dinomo-br-rdma-forward.sh
+sudo tee /etc/systemd/system/dinomo-br-rdma-forward.service > /dev/null << 'FWUNIT'
+[Unit]
+Description=Allow DINOMO VM traffic across br-rdma
+After=network-online.target docker.service libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dinomo-br-rdma-forward.sh
+
+[Install]
+WantedBy=multi-user.target
+FWUNIT
+sudo systemctl daemon-reload
+sudo systemctl enable dinomo-br-rdma-forward.service
+sudo systemctl restart dinomo-br-rdma-forward.service
+
 echo "  Phase 1 done."
 ENDSSH
 

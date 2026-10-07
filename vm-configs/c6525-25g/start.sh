@@ -16,44 +16,84 @@ echo " Starting DINOMO on ${CLOUDLAB_HOST}"
 echo "============================================"
 
 # ------------------------------------------------------------
-# Step 1: Install dependencies and build DINOMO binaries
+# Step 1: Sync local source to every VM, install deps, build
 # ------------------------------------------------------------
+# The VMs build from *this* working tree (including uncommitted changes), not
+# from a git remote: the fork is private, so the VMs cannot fetch it. Source goes
+# local -> host staging dir -> each VM. --checksum without -t means only files
+# whose content changed are rewritten, and they get a fresh mtime, so the
+# incremental `make` below rebuilds exactly what changed.
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+VM_DINOMO_REL="${DINOMO_DIR#\~/}"   # rsync dest relative to the VM user's home
+HOST_STAGING="dinomo-src-sync"      # relative to the host user's home
+# Excluded paths are also protected from --delete on the receiving side:
+# build dirs, the VM's old .git, the deployed config, and runtime logs.
+RSYNC_EXCLUDES=(--exclude=.git/ --exclude=build/ --exclude=/conf/dinomo-config.yml
+                --exclude='/log_*.txt' --exclude='/client*.log')
+
 echo ""
-echo "[1/7] Installing dependencies & building DINOMO across nodes..."
-$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_STORAGE='${VM_STORAGE}' VM_KVS='${VM_KVS}' VM_ROUTE='${VM_ROUTE}' VM_MONITOR='${VM_MONITOR}' VM_BENCH='${VM_BENCH}' VM_USER='${VM_USER}' DINOMO_DIR='${DINOMO_DIR}' bash -s" << 'ENDSSH'
+echo "[1/7] Syncing source, installing dependencies & building DINOMO..."
+echo "  Syncing ${REPO_ROOT} -> ${CLOUDLAB_HOST}:~/${HOST_STAGING}"
+rsync -rlp --checksum --delete --filter=':- .gitignore' "${RSYNC_EXCLUDES[@]}" \
+  -e "${SSH}" "${REPO_ROOT}/" ${SSH_USER}@${CLOUDLAB_HOST}:${HOST_STAGING}/
+
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_STORAGE='${VM_STORAGE}' VM_KVS='${VM_KVS}' VM_ROUTE='${VM_ROUTE}' VM_MONITOR='${VM_MONITOR}' VM_BENCH='${VM_BENCH}' VM_USER='${VM_USER}' VM_DINOMO_REL='${VM_DINOMO_REL}' HOST_STAGING='${HOST_STAGING}' RSYNC_EXCLUDES='${RSYNC_EXCLUDES[*]}' bash -s" << 'ENDSSH'
+set -f   # RSYNC_EXCLUDES arrives as one string; split it on spaces but do not glob "log_*.txt"
+VM_SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+pids=()
 for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
-  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${VM_USER}@${vm_ip} "
-    # Install build tools and libraries (including jemalloc and protobuf)
-    sudo apt-get update -qq && sudo apt-get install -y -qq \
-      build-essential cmake pkg-config libjemalloc-dev libprotobuf-dev \
-      protobuf-compiler libibverbs-dev librdmacm-dev libgflags-dev \
-      libgoogle-glog-dev libsnappy-dev libboost-all-dev libgrpc++-dev protobuf-compiler-grpc \
-      ibverbs-utils
+  (
+    set -e
+    rsync -rlp --checksum --delete ${RSYNC_EXCLUDES} -e "${VM_SSH}" \
+      ~/${HOST_STAGING}/ ${VM_USER}@${vm_ip}:${VM_DINOMO_REL}/
+    ${VM_SSH} ${VM_USER}@${vm_ip} "DIR='${VM_DINOMO_REL}' bash -s" << 'VMSSH'
+set -e
+# Install build tools and libraries (including jemalloc and protobuf)
+sudo apt-get update -qq && sudo apt-get install -y -qq \
+  build-essential cmake pkg-config libjemalloc-dev libprotobuf-dev \
+  protobuf-compiler libibverbs-dev librdmacm-dev libgflags-dev \
+  libgoogle-glog-dev libsnappy-dev libboost-all-dev libgrpc++-dev protobuf-compiler-grpc \
+  ibverbs-utils rsync > /dev/null
 
-    cd ${DINOMO_DIR}
-    git submodule update --init --recursive
+cd ~/${DIR}
 
-    # Link dinomo-config.yml on every node
-    # dinomo binary looks for conf/dinomo-config.yml instead of conf/dinomo-base.yml
-    ln -sf dinomo-base.yml conf/dinomo-config.yml 2>/dev/null || true
+# -mavx2 crashes with an illegal instruction if the VM CPU does not expose AVX2.
+grep -qw avx2 /proc/cpuinfo || sed -i 's/-mavx2//g' CMakeLists.txt
 
-    # Build libbloom dependency if libbloom.so is missing
-    if [ ! -f src/kvs/libbloom/build/libbloom.so ]; then
-      echo '  Building libbloom dependency...'
-      (cd src/kvs/libbloom && make)
-    fi
+# Build libbloom dependency if libbloom.so is missing
+if [ ! -f src/kvs/libbloom/build/libbloom.so ]; then
+  (cd src/kvs/libbloom && make > /tmp/libbloom-make.log 2>&1)
+fi
 
-    # Build DINOMO if target binary does not exist
-    if [ ! -f ${DINOMO_DIR}/build/target/kvs/dinomo-storage ]; then
-      echo '  Building DINOMO on \$(hostname)...'
-      cd ${DINOMO_DIR}
-      rm -rf build && mkdir -p build && cd build
-      cmake .. && make -j\$(nproc)
-    fi
-  " &
+# Incremental build: configure once, then make picks up whatever the sync changed.
+mkdir -p build && cd build
+[ -f Makefile ] || cmake .. -DCMAKE_BUILD_TYPE=Release > /tmp/cmake.log 2>&1
+if ! make -j$(nproc) > /tmp/make.log 2>&1; then
+  echo "  BUILD FAILED on $(hostname). Last lines of /tmp/make.log:"
+  tail -20 /tmp/make.log | sed 's/^/    /'
+  exit 1
+fi
+echo "  built: $(hostname)"
+VMSSH
+  ) &
+  pids+=($!)
 done
-wait
+fail=0
+for p in "${pids[@]}"; do wait $p || fail=1; done
+exit $fail
 ENDSSH
+
+# Deploy conf/dinomo-config.yml (the file every binary loads) to each VM.
+# Do NOT link it to conf/dinomo-base.yml: that is the Kubernetes template, which
+# has a NODE_UID placeholder for ib_config.rank and no server/user sections.
+# rm first so we replace any old symlink instead of writing through it.
+echo "  Deploying conf/dinomo-config.yml..."
+for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
+  $SSH ${SSH_USER}@${CLOUDLAB_HOST} \
+    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${VM_USER}@${vm_ip} \
+     'rm -f ${DINOMO_DIR}/conf/dinomo-config.yml && cat > ${DINOMO_DIR}/conf/dinomo-config.yml'" \
+    < "${SCRIPT_DIR}/conf/dinomo-vm-config.yml"
+done
 echo "  Done."
 
 # ------------------------------------------------------------
@@ -120,7 +160,7 @@ for i in $(seq 1 30); do
   sleep 2
   ready=$($SSH ${SSH_USER}@${CLOUDLAB_HOST} \
     "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_STORAGE} \
-     'grep -c \"start to listen\" /tmp/dinomo-storage.log 2>/dev/null || echo 0'")
+     'grep -c \"start to listen\" /tmp/dinomo-storage.log 2>/dev/null || true'")
   if [ "${ready}" -ge 1 ] 2>/dev/null; then
     echo " ready."
     break
@@ -138,6 +178,21 @@ done
 # ------------------------------------------------------------
 echo ""
 echo "[5/7] Starting dinomo-kvs..."
+
+# Pre-check TCP from kvs to storage over br-rdma (port 22 so the waiting storage
+# listener is not consumed). If host firewall drops bridged traffic, the kvs
+# connect() would hang ~127s before failing; catch it here instead.
+STORAGE_RDMA_IP=$(awk '/storage_node_ips:/ {getline; print $2; exit}' "${SCRIPT_DIR}/conf/dinomo-vm-config.yml")
+if ! $SSH ${SSH_USER}@${CLOUDLAB_HOST} \
+    "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_KVS} \
+     'timeout 5 bash -c \"</dev/tcp/${STORAGE_RDMA_IP}/22\"'" 2>/dev/null; then
+  echo "ERROR: kvs cannot open TCP to storage at ${STORAGE_RDMA_IP} over br-rdma."
+  echo "  Host firewall is likely dropping bridged traffic. On ${CLOUDLAB_HOST} run:"
+  echo "    sudo iptables -I FORWARD 1 -i br-rdma -o br-rdma -j ACCEPT"
+  exit 1
+fi
+echo "  TCP to storage (${STORAGE_RDMA_IP}) over br-rdma: ok"
+
 $SSH ${SSH_USER}@${CLOUDLAB_HOST} "VM_KVS='${VM_KVS}' VM_USER='${VM_USER}' DINOMO_DIR='${DINOMO_DIR}' bash -s" << 'ENDSSH'
 ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_KVS} "
   cd ${DINOMO_DIR}
@@ -179,9 +234,21 @@ echo ""
 echo "[7/7] Waiting for kvs RDMA handshake (STEP4 on all 4 threads)..."
 for i in $(seq 1 30); do
   sleep 2
-  step4_count=$($SSH ${SSH_USER}@${CLOUDLAB_HOST} \
+  # One round trip returns: <threads ready> <kvs alive 1/0> <[ERROR] lines>
+  read -r step4_count kvs_alive err_count <<< "$($SSH ${SSH_USER}@${CLOUDLAB_HOST} \
     "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_KVS} \
-     'grep -c \"raddr_pool=\" /tmp/dinomo-kvs.log 2>/dev/null || echo 0'")
+     'c=\$(grep -c \"raddr_pool=\" /tmp/dinomo-kvs.log 2>/dev/null); \
+      e=\$(grep -c -F \"[ERROR]\" /tmp/dinomo-kvs.log 2>/dev/null); \
+      pgrep -x dinomo-kvs >/dev/null && a=1 || a=0; \
+      echo \${c:-0} \$a \${e:-0}'")"
+  # Fail fast instead of waiting out the full 60s when kvs has already died.
+  if [ "${kvs_alive}" = "0" ] || [ "${err_count:-0}" -gt 0 ] 2>/dev/null; then
+    echo ""
+    echo "ERROR: dinomo-kvs failed (alive=${kvs_alive}, [ERROR] lines=${err_count}). Last log lines:"
+    $SSH ${SSH_USER}@${CLOUDLAB_HOST} \
+      "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_KVS} 'tail -15 /tmp/dinomo-kvs.log'" | sed 's/^/    /'
+    exit 1
+  fi
   echo -n "  ${step4_count}/4 threads ready..."
   if [ "${step4_count}" -ge 4 ] 2>/dev/null; then
     echo " done."

@@ -116,7 +116,7 @@ if [ "${finished}" -ge 1 ] 2>/dev/null; then
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} \
     "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} \
      'tail -n +${LINE_BEFORE} ~/projects/DINOMO/log_0.txt'" \
-    | grep -E "Epoch [0-9]+\] Throughput|Median latency|tail latency" \
+    | grep -E "Epoch [0-9]+\] Throughput|Average latency|Min latency|Max latency|Median latency|tail latency" \
     | sed 's/^/    /'
 else
   echo "  FAIL: RUN write-only did not complete."
@@ -142,7 +142,7 @@ if [ "${finished}" -ge 1 ] 2>/dev/null; then
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} \
     "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} \
      'tail -n +${LINE_BEFORE} ~/projects/DINOMO/log_0.txt'" \
-    | grep -E "Epoch [0-9]+\] Throughput|Median latency|tail latency" \
+    | grep -E "Epoch [0-9]+\] Throughput|Average latency|Min latency|Max latency|Median latency|tail latency" \
     | sed 's/^/    /'
 else
   echo "  FAIL: RUN read-only did not complete."
@@ -168,7 +168,7 @@ if [ "${finished}" -ge 1 ] 2>/dev/null; then
   $SSH ${SSH_USER}@${CLOUDLAB_HOST} \
     "ssh -o StrictHostKeyChecking=no ${VM_USER}@${VM_BENCH} \
      'tail -n +${LINE_BEFORE} ~/projects/DINOMO/log_0.txt'" \
-    | grep -E "Epoch [0-9]+\] Throughput|Median latency|tail latency" \
+    | grep -E "Epoch [0-9]+\] Throughput|Average latency|Min latency|Max latency|Median latency|tail latency" \
     | sed 's/^/    /'
 else
   echo "  FAIL: RUN mixed did not complete."

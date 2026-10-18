@@ -1,5 +1,9 @@
 # NUMA memory-pool latency experiment
 
+For the first functional DINOMO shared-memory implementation, see
+[dinomo/README.md](dinomo/README.md). Its runner tests the existing DINOMO
+compute methods and PMDK CLHT against a node 1 pool with node 1 CPUs offline.
+
 This experiment models the planned single-server DINOMO layout:
 
 - Linux NUMA node 0 is the compute/host node. Its CPUs stay online.

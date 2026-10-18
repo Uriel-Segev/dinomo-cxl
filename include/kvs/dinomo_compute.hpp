@@ -17,6 +17,10 @@
 
 #include "tbb/concurrent_queue.h"
 
+#ifdef DINOMO_NUMA_MILESTONE
+#include "kvs/numa_backend.hpp"
+#endif
+
 #define SET_IMM(x, y)               (uint32_t)(x << 16) | (y)
 #define SET_MERGE_ALL(x)            (uint32_t)(x | (0b1 << 31))
 #define SET_FAILOVER(x)             (uint32_t)(x | (0b11 << 30))
@@ -554,6 +558,10 @@ void Dinomo<T>::push_log_list()
 template <typename T>
 void Dinomo<T>::preallocate_log_blocks(uint32_t lkey_buf, struct ibv_qp *qp, char *buf_ptr, struct ibv_cq *cq, struct ibv_wc *wc, int num_wc)
 {
+#ifdef DINOMO_NUMA_MILESTONE
+    dinomo_numa::allocate_logs(log_blocks_raddrs, MAX_PREALLOC_NUM);
+    return;
+#endif
     int ret = 0, n = 0;
     bool stop = false;
 
@@ -1812,10 +1820,15 @@ void Dinomo<T>::merge(bool clear_cache)
                     &rdma_write_counter, &rdma_write_payload);
         }
 
+#ifdef DINOMO_NUMA_MILESTONE
+        dinomo_numa::merge_logs();
+        stop = true;
+#else
         ret = post_send_imm_profile(0, lkey_buf, (uint64_t)buf_ptr, 
                 SET_MERGE_ALL(SET_IMM(config_info.rank, thread_id)),
                 qp, buf_ptr, &rdma_send_counter, &rdma_send_payload);
         check(ret == 0, "Thread[%ld]: failed to post send", thread_id);
+#endif
 
         while (stop != true)
         {
@@ -1855,6 +1868,20 @@ void Dinomo<T>::merge(bool clear_cache)
         }
 
         clear_log_list();
+#ifdef DINOMO_NUMA_MILESTONE
+        // The manager has indexed every published record. Retire the active
+        // local log too, so subsequent reads traverse CLHT and subsequent
+        // updates cannot find an older copy in the old staging block.
+        free(BFilter->bf);
+        free(BFilter->local_log_block);
+        free(BFilter);
+        BFilter = nullptr;
+        pool->offset.store(0);
+        pool->merged_offset.store(0);
+        pool->valid_counter.store(0);
+        pool->next.store(0);
+        non_replicated_alloc = 0;
+#endif
     }
 
     if (clear_cache)

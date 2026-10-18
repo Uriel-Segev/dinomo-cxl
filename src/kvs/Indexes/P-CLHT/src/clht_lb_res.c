@@ -238,7 +238,15 @@ clht_t* clht_create(uint64_t num_buckets, int num_peers,
 
     // Open the PMEMpool if it exists, otherwise create it
     pool_size = storage_capacities;
-#ifdef ENABLE_PMEM
+#ifdef DINOMO_NUMA_MILESTONE
+    /* Private per-run tmpfs pool; never reuse or truncate the RDMA pool. */
+    const char *numa_pool_path = getenv("DINOMO_NUMA_POOL_PATH");
+    if (numa_pool_path == NULL) {
+        fprintf(stderr, "DINOMO_NUMA_POOL_PATH is required\n");
+        return NULL;
+    }
+    pop = pmemobj_create(numa_pool_path, POBJ_LAYOUT_NAME(clht), pool_size, 0600);
+#elif defined(ENABLE_PMEM)
     if (access("/mnt/pmem0/pool", F_OK) != -1)
         pop = pmemobj_open("/mnt/pmem0/pool", POBJ_LAYOUT_NAME(clht));
     else
@@ -250,8 +258,10 @@ clht_t* clht_create(uint64_t num_buckets, int num_peers,
         pop = pmemobj_create("/dev/shm/pool", POBJ_LAYOUT_NAME(clht), pool_size, 0666);
 #endif
 
-    if (pop == NULL)
+    if (pop == NULL) {
         perror("failed to open the pool\n");
+        return NULL;
+    }
 
     // Create the root pointer
     PMEMoid my_root = pmemobj_root(pop, sizeof(clht_t));

@@ -9,7 +9,7 @@
 # -------------------------------------------------------
 # CHANGE THIS for each new CloudLab experiment
 # -------------------------------------------------------
-CLOUDLAB_HOST="@amd181.utah.cloudlab.us"
+CLOUDLAB_HOST="amd181.utah.cloudlab.us"
 
 # -------------------------------------------------------
 # Change these if your SSH setup is different

@@ -77,6 +77,7 @@ printf '%s\n' "run_id=${RUN_ID}" "host=${CLOUDLAB_HOST}" \
   "duration_seconds=${TRACE_DURATION}" "report_period_seconds=${TRACE_REPORT_PERIOD}" \
   "outstanding_requests=${TRACE_OUTSTANDING}" "seed=${TRACE_SEED}" \
   "repetitions=${TRACE_REPETITIONS}" "drain_timeout_seconds=${TRACE_DRAIN_TIMEOUT}" \
+  "memory_cap_mb=${MEMORY_CAP:-default}" \
   > "${RESULTS_DIR}/parameters.txt"
 sha256sum "${RESULTS_DIR}/trace.csv" > "${RESULTS_DIR}/trace.sha256"
 current_output_dir=""
@@ -94,6 +95,13 @@ for (( repetition=1; repetition<=TRACE_REPETITIONS; repetition++ )); do
   mkdir -p "${current_output_dir}"
   echo "[Trace ${repetition}/${TRACE_REPETITIONS}] Resetting and starting DINOMO..."
   bash "${SCRIPT_DIR}/start.sh" 2>&1 | tee "${current_output_dir}/start.log"
+  #save a copy of the config the KVS VM is actually running with, as record of the cache size that was used
+  #the file on the VM; single quotes keep $HOME as-is so the VM fills it in (home/ubuntu/)
+  kvs_config_on_vm='$HOME/projects/DINOMO/conf/dinomo-config.yml'
+  #where to save it: this repetition's results folder (e.g. run-01/)
+  kvs_config_saved="${current_output_dir}/kvs-config.yml"
+  #copy it from the KVS VM to the machine (existing helper in bench_helper.sh)
+  capture_vm_file "${VM_KVS}" "${kvs_config_on_vm}" "${kvs_config_saved}"
   remote_trace="/tmp/dinomo-trace-${RUN_ID}-${repetition}.csv"
   # Generated remote path contains only safe characters; CSV bytes use stdin.
   $SSH "${SSH_USER}@${CLOUDLAB_HOST}" \

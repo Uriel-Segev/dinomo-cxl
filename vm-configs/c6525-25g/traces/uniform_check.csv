@@ -1,0 +1,2 @@
+phase,duration_s,read_ratio,hot_start,hot_count,hot_probability
+uniform,60,0.95,1,1000000,0.00

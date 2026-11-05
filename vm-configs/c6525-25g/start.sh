@@ -32,6 +32,41 @@ ENDSSH
 echo "  Done."
 
 # ------------------------------------------------------------
+# Step 1b: Set the KVS cache size (memory-cap) on all VMs
+# ------------------------------------------------------------
+# MEMORY_CAP (in MB) can be passed in, e.g.: MEMORY_CAP=4 bash start.sh
+# If it is not given, use the default from the repo's config file.
+
+#read the default cache size from the repo's config (dinomo-vm-config.yml)
+DEFAULT_MEMORY_CAP=$(tr -d '\r' < "${SCRIPT_DIR}/conf/dinomo-vm-config.yml" \
+  | awk '$1 == "memory-cap:" {print $2}')
+
+#use MEMORY_CAP if it was given, otherwise the default
+MEMORY_CAP="${MEMORY_CAP:-${DEFAULT_MEMORY_CAP}}"
+
+#stop if it's not a positive whole number
+if ! [[ "${MEMORY_CAP}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: MEMORY_CAP must be a positive whole number of MB (got '$MEMORY_CAP')"
+  exit 1
+fi
+
+echo ""
+echo "[1b/6] setting memory-cap to ${MEMORY_CAP} MB on all VMs"
+
+#run the following on the cloudlab host
+$SSH ${SSH_USER}@${CLOUDLAB_HOST} 'bash -s' << ENDSSH
+#loop over all 5 VMs
+for vm_ip in ${VM_STORAGE} ${VM_KVS} ${VM_ROUTE} ${VM_MONITOR} ${VM_BENCH}; do
+  #on each vm, replace the number on the memory-cap line; stop if it fails
+  ssh -o StrictHostKeyChecking=no ${VM_USER}@\${vm_ip} \
+    "sed -i 's/^\( *memory-cap:\).*/\1 ${MEMORY_CAP}/' ~/projects/DINOMO/conf/dinomo-config.yml" || exit 1
+done
+ENDSSH
+echo "done"
+
+
+
+# ------------------------------------------------------------
 # Step 2: Load Soft-RoCE in storage and kvs VMs
 # ------------------------------------------------------------
 echo ""

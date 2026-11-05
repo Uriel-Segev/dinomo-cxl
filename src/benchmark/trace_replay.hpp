@@ -105,7 +105,7 @@ bool replay(Client &client, const std::vector<Phase> &phases, unsigned num_keys,
         if (now >= deadline) break;
         // Split intervals at every phase boundary, including phases skipped by a
         // delayed poll. Outstanding requests remain live across transitions.
-        while (now >= start + std::chrono::seconds(phases[phase].end_s)) {
+        while (now >= start + std::chrono::seconds(phases[phase].end_s)) { //while instead of if so it doesn't skip phases if program stalled
             flush(start + std::chrono::seconds(phases[phase].end_s), true);
             boundary("phase_end", phase, now);
             ++phase;

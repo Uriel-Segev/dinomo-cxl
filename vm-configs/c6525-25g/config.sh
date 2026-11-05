@@ -9,12 +9,12 @@
 # -------------------------------------------------------
 # CHANGE THIS for each new CloudLab experiment
 # -------------------------------------------------------
-CLOUDLAB_HOST="dinomo-host.vinothg-315218.davissystems-pg0.utah.cloudlab.us"
+CLOUDLAB_HOST="@amd181.utah.cloudlab.us"
 
 # -------------------------------------------------------
 # Change these if your SSH setup is different
 # -------------------------------------------------------
-SSH_USER="vinothg"
+SSH_USER="Uriel"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 
 # -------------------------------------------------------
@@ -36,7 +36,7 @@ VM_BENCH="192.168.122.167"
 VM_USER="ubuntu"
 DINOMO_DIR="~/projects/DINOMO"
 DINOMO_REPO="https://github.com/Uriel-Segev/dinomo-cxl.git"
-DINOMO_BRANCH="cloudlab-softroce"
+DINOMO_BRANCH="cache_size_alignment"
 
 # -------------------------------------------------------
 # Node-type-specific settings

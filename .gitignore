@@ -1,4 +1,6 @@
 build
+build-numa/
+__pycache__/
 cscope.files
 cscope.out
 tags

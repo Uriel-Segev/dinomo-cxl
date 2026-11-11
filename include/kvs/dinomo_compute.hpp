@@ -1104,6 +1104,10 @@ error:
 template <typename T>
 void Dinomo<T>::putMeta(const char *key, const size_t key_len, const void *value, const uint64_t val_len)
 {
+#ifdef DINOMO_NUMA_SERVER
+    dinomo_numa::put_metadata(key, key_len, value, val_len);
+    return;
+#endif
 #ifdef SEKWON_DEBUG
     printf("%s\n", __func__);
 #endif
@@ -1669,6 +1673,14 @@ std::pair<char *, size_t> Dinomo<T>::getReplicated(const uint64_t key, const siz
 template <typename T>
 std::pair<char *, size_t> Dinomo<T>::getMeta(const char *key, const size_t key_len)
 {
+#ifdef DINOMO_NUMA_SERVER
+    auto numa_result = dinomo_numa::get_metadata(key, key_len);
+    if (!numa_result.first) return {nullptr, 0};
+    if (numa_result.second.size() > ib_res.ib_buf_size)
+        throw std::runtime_error("NUMA metadata reply exceeds compute buffer");
+    memcpy(ib_res.ib_buf, numa_result.second.data(), numa_result.second.size());
+    return {ib_res.ib_buf, numa_result.second.size()};
+#endif
 #ifdef SEKWON_DEBUG
     printf("%s\n", __func__);
 #endif

@@ -69,12 +69,28 @@ class DinomoKVStore {
 
         unsigned put(const uint64_t k, const size_t key_len, const void *v, const size_t val_len)
         {
+#ifdef DINOMO_NUMA_SERVER
+            if (val_len > MAX_LOG_BLOCK_LEN - sizeof(oplogs))
+                throw std::runtime_error("NUMA value exceeds log record capacity");
+            unsigned result = db.put(k, key_len, v, val_len, false);
+            db.merge(true);
+            return result;
+#else
             return db.put(k, key_len, v, val_len, false);
+#endif
         }
 
         unsigned update(const uint64_t k, const size_t key_len, const void *v, const size_t val_len)
         {
+#ifdef DINOMO_NUMA_SERVER
+            if (val_len > MAX_LOG_BLOCK_LEN - sizeof(oplogs))
+                throw std::runtime_error("NUMA value exceeds log record capacity");
+            unsigned result = db.put(k, key_len, v, val_len, true);
+            db.merge(true);
+            return result;
+#else
             return db.put(k, key_len, v, val_len, true);
+#endif
         }
 
         void remove(const uint64_t k, const size_t key_len)

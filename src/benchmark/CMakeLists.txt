@@ -13,3 +13,9 @@ TARGET_LINK_LIBRARIES(dinomo-bench-trigger anna-hash-ring ${KV_LIBRARY_DEPENDENC
 ADD_DEPENDENCIES(dinomo-bench-trigger anna-hash-ring zeromq zeromqcpp)
 
 ADD_EXECUTABLE(dinomo-trace-check trace_check.cpp)
+
+if (BUILD_NUMA_SERVER)
+    add_executable(dinomo-numa-client-check numa_client_check.cpp)
+    target_link_libraries(dinomo-numa-client-check anna-hash-ring ${KV_LIBRARY_DEPENDENCIES})
+    add_dependencies(dinomo-numa-client-check anna-hash-ring zeromq zeromqcpp)
+endif()

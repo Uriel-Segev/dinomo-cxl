@@ -179,93 +179,123 @@ transferred by cloning. Copy results off the old machine if they are needed.
 The five-VM configuration in vm-configs/c6525-25g/config.sh is separate and
 contains host-specific SSH settings; it is not used by run_milestone.sh.
 
-## Next milestone: requests through the network KVS server
+## Milestone 2: one network KVS worker with a NUMA pool
 
-The next acceptance target is one network-facing KVS worker serving an existing
-DINOMO client, with storage management on node 0 and the shared pool on node 1.
-Keep explicit merge boundaries and one worker until this path is correct.
-The following steps are planned work, not capabilities of the current runner.
+The `dinomo-kvs-numa` target now serves the existing C++ `KvsClient` API
+through DINOMO's request handler, LWW serializer, wrapper, and compute engine.
+A host-native routing process provides membership discovery. Monitoring is
+not required for this bounded test with reporting and policies disabled.
+No VMs, Soft-RoCE device, or RDMA device operations are used.
 
-### 1. Audit startup and the complete request path
+The server runs one uncached, unbatched worker and a separate manager on the
+selected host CPU. Both access the private tmpfs-backed PMDK pool placed on the
+selected memory node. The existing RDMA target and standalone milestone remain
+available.
 
-Trace server startup, one insert, one GET, one UPDATE, and the control requests
-needed to join the cluster. Record every required transport operation before
-wiring in the NUMA backend.
+### Build and dependencies
 
-| File, relative to repository root | Work to inspect |
-|---|---|
-| src/kvs/server.cpp | ib_init startup, worker construction, and ib_finalize shutdown |
-| src/kvs/user_request_handler.cpp | Client request dispatch and response handling |
-| include/kvs/dinomo_compute.hpp | Data operations, allocation, merge, and metadata operations |
-| src/kvs/numa_backend.cpp | Current pool mapping, address translation, manager IPC, and lifecycle |
-| src/kvs/dinomo_storage.cpp | Original management requests, merge processing, and GC responsibilities |
-| src/kvs/dpm.cpp | Original standalone storage startup |
-| src/kvs/CMakeLists.txt | Server/storage sources and dependencies |
-| conf/dinomo-local.yml | Existing configuration to assess for a host-native setup |
+In addition to the standalone milestone dependencies, the full server/client
+build needs CMake, Protobuf/compiler, jemalloc, Boost system/thread, and
+ZeroMQ/cppzmq, spdlog, and yaml-cpp. CMake downloads pinned vendor sources, so
+the first build requires network access.
 
-The current backend throws on unsupported SEND paths. Routing/monitoring
-startup may invoke metadata operations even when the user workload only uses
-GET/UPDATE. Implement or explicitly account for those required paths; do not
-convert unsupported requests into successful no-ops.
+~~~bash
+cd ~/dinomo-cxl
+make -C src/kvs/libbloom -j4
+cmake -S . -B build/numa -DCMAKE_BUILD_TYPE=Release -DBUILD_NUMA_SERVER=ON
+cmake --build build/numa --target dinomo-kvs-numa dinomo-numa-client-check dinomo-route -j4
+~~~
 
-Acceptance: a documented list of startup and request-path dependencies, with
-each required helper classified as implemented or needing a NUMA equivalent.
+### Run network correctness
 
-### 2. Add explicit server backend selection and initialization
+The runner builds the targets, creates isolated configuration and logs, starts
+routing/server/client on the host CPU, checks results and placement, and
+removes its manager and temporary pool. By default it offlines the pool-node
+CPUs and restores those it changed on exit, failure, or interruption.
 
-Add a dedicated NUMA server build/configuration that selects the shared-memory
-implementation instead of linking ib.cpp. Retain the existing RDMA target.
-Configure host CPU/node, pool node, pool size, and a private pool path without
-hard-coding the previous CloudLab host or VM IP addresses.
+~~~bash
+cd ~/dinomo-cxl
 
-The current start() function forks the manager. Call it before launching
-threads, or change the manager to a separately launched process with an attach
-protocol. Do not simply fork it from inside an already multithreaded server.
-Replace the RDMA-only initialization and finalization paths for this target.
-Give startup failures and normal shutdown a clear manager/pool cleanup path.
+# Local control: node 0 pool, all CPUs online.
+MEMORY_NODE=0 ./numa-test/dinomo/run_network_test.sh --no-offline
 
-Acceptance: the NUMA server initializes without an RDMA device, starts exactly
-one KVS worker, and shuts down without leaving a manager or temporary pool.
+# Target: node 1 pool, node 1 CPUs offline during the test.
+./numa-test/dinomo/run_network_test.sh
 
-### 3. Bring up routing, monitoring, and a client on node 0
+# Confirm CPU restoration.
+./numa-test/numa_cpu_control.sh status
+~~~
 
-Create a separate host-native configuration and launcher for the NUMA setup.
-Pin every component and any background helper to host-node CPUs. Keep ordinary
-process buffers/caches local to node 0 and only shared storage structures in
-the node 1 pool. Verify pool placement after startup and under workload.
+Defaults are `HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 NUM_KEYS=256`.
+Adjust them to the machine's topology; `NUM_KEYS` supports 1..2000.
+Use `--no-offline` for a remote pool with its CPUs online.
+Run the script as the ordinary user; sudo is used for CPU hotplug.
+SIGKILL or power loss cannot run cleanup traps; use the existing CPU restore
+command if necessary.
 
-Start only the components the audited request path requires. Use the existing
-client API to insert a known key, read it, update it, and read the changed
-value. Add bounded waits so a missing reply reports a failure rather than
-hanging indefinitely.
+The C++ client checks:
+- Missing user and metadata keys.
+- Metadata PUT, GET, and UPDATE, including binary values.
+- Insert/read, update/read, and another update/read for every user key.
+- Changing value lengths and embedded NUL bytes.
+- Later reads of all keys after repeated allocation/merge cycles.
 
-Acceptance: a client outside the KVS process receives the expected values and
-missing-key behavior while the pool node has no online CPUs.
+The client never sends merge commands or clears worker staging. The server
+owns the visibility boundary. Startup tests also reject a multiworker
+configuration and check missing-router failure, SIGTERM exit, manager reaping,
+and private-pool removal. Evidence is saved under `results/server-startup-*`:
+configuration, topology, commit ID/working-tree status, and client/server/router
+logs. The final server log includes transfer, allocation, and metadata counters.
 
-### 4. Make log publication and merge behavior work across client requests
+For startup/lifecycle checks without the client or CPU hotplug:
 
-The current test calls merge explicitly between insert and read phases. Define
-how the network server triggers merge and when an acknowledged update becomes
-visible to a later GET. Test reads before and after merge, repeated updates to
-the same key, variable value lengths, and allocation/log rollover.
+~~~bash
+python3 numa-test/dinomo/test_server_startup.py --host-cpu 2 --memory-node 1
+~~~
 
-Audit local staging lookups as well as shared-index lookups: a cache or staging
-hit must not return an older value after an update. Preserve write-before-
-publication ordering and request/response synchronization. Continue to reject
-unsupported replication or asynchronous paths explicitly.
+### Visibility and metadata contract
 
-Acceptance: correctness holds for interleaved client requests, without the
-test harness manually clearing staging or hiding stale values with phase order.
+For this target, each user PUT/UPDATE writes a log record and synchronously
+merges it into the original P-CLHT index before returning to the request
+handler for acknowledgement. The NUMA merge retires local staging and clears
+caches, so a following GET uses the shared index and sees the acknowledged
+value. This avoids relying on the old staging scan's first-match behavior.
+There is no background merge or concurrent worker access.
 
-### 5. Save a repeatable network-level correctness test
+Metadata GET/PUT use bounded synchronous Unix-domain IPC to a volatile
+string-key store in manager-local memory, like the original storage metadata
+store. User records and the index reside in the selected shared pool.
+Metadata keys plus values must fit the 64 KiB IPC payload. User values, including
+their serialized LWW envelope, must fit one log block after its record header
+(the configuration uses 4 KiB total log blocks). Oversized requests fail
+explicitly. Missing results are handled before LWW deserialization.
 
-Add a runner that builds the NUMA server target, starts its local components,
-offlines the pool-node CPUs, checks placement, sends client operations, and
-cleans up. Save topology, configuration, commit ID, and logs for each run.
-Repeat with both a local pool and a remote memory-only pool.
+Merge-before-ack retires a log for every write and the current allocator
+requests fresh batches, so space use is intentionally inefficient. Logs are
+not reclaimed. This is a bounded correctness configuration, not a sustained
+workload or performance configuration. The standalone milestone still tests
+capacity-driven log rollover separately.
 
-Acceptance: a single command passes the same client-visible checks in both
-placements and restores the machine on success, failure, or interruption.
+### Validation on c8220
+
+The 256-key network test passed for:
+- A local node 0 pool with all CPUs online:
+  `results/server-startup-2_jmpy_5`.
+- A remote node 1 pool with all 20 node 1 logical CPUs offline:
+  `results/server-startup-9n624dqy`.
+
+Both runs verified 256/256 sampled pool pages on the requested node at startup
+and shutdown. Each recorded 5,895 shared reads, 3,073 shared writes, 1,536
+allocated log blocks, four metadata GETs, and two metadata PUTs.
+The remote runner restored CPUs afterward. The standalone 1,000-key local
+milestone also passed after the IPC changes. These ignored evidence directories
+are machine-local and are not transferred by cloning.
+SIGTERM interruption during remote startup also passed pool removal and CPU
+restoration checks; evidence is in
+`results/server-startup-4f8x20fj/INTERRUPTION_PASS`.
+
+The initial source audit and implementation notes are in
+[NETWORK_INTEGRATION_AUDIT.md](NETWORK_INTEGRATION_AUDIT.md).
 
 ## Later milestones, after network correctness
 

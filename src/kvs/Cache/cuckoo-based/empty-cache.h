@@ -97,6 +97,9 @@ namespace sekwonlee {
     template <class TKey, class TValue>
         bool EmptyCache<TKey, TValue>::
         insert(const TKey& key, const TValue& value, const size_t &valLen, const uint64_t& shortCut) {
+#ifdef DINOMO_NUMA_SERVER
+            free(value);
+#endif
             return true;
         }
 

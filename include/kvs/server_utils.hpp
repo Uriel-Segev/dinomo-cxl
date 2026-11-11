@@ -96,6 +96,10 @@ class MemoryLWWSerializer : public Serializer
     string get(const Key &key, AnnaError &error)
     {
         std::pair<char *, size_t> ret = kvs_->get(stoul(key, nullptr, 0), sizeof(uint64_t), error);
+        if (!ret.first || ret.second == 0) {
+            error = AnnaError::KEY_DNE;
+            return "";
+        }
         LWWPairLattice<string> val = deserialize_lww(string(ret.first, ret.second));
         if (val.reveal().value == "")
         {
@@ -109,7 +113,11 @@ class MemoryLWWSerializer : public Serializer
     {
         LWWPairLattice<string> val = deserialize_lww(serialized);
         // TODO: need to add a function removing alphabetic representations from the key.
+#ifdef DINOMO_NUMA_SERVER
+        return kvs_->put(stoul(key, nullptr, 0), sizeof(uint64_t), serialized.data(), serialized.size());
+#else
         return kvs_->put(stoul(key, nullptr, 0), sizeof(uint64_t), serialized.c_str(), serialized.size() + 1);
+#endif
         //return val.reveal().size();
     }
     
@@ -118,6 +126,10 @@ class MemoryLWWSerializer : public Serializer
     string getMeta(const Key &key, AnnaError &error)
     {
         std::pair<char *, size_t> ret = kvs_->getMeta(key.c_str(), key.size() + 1, error);
+        if (!ret.first || ret.second == 0) {
+            error = AnnaError::KEY_DNE;
+            return "";
+        }
         LWWPairLattice<string> val = deserialize_lww(string(ret.first, ret.second));
         if (val.reveal().value == "")
         {
@@ -130,13 +142,21 @@ class MemoryLWWSerializer : public Serializer
     unsigned putMeta(const Key &key, const string &serialized)
     {
         LWWPairLattice<string> val = deserialize_lww(serialized);
+#ifdef DINOMO_NUMA_SERVER
+        kvs_->putMeta(key.c_str(), key.size() + 1, serialized.data(), serialized.size());
+#else
         kvs_->putMeta(key.c_str(), key.size() + 1, serialized.c_str(), serialized.size() + 1);
+#endif
         return val.reveal().size();
     }
 
     string getReplicated(const Key &key, AnnaError &error)
     {
         std::pair<char *, size_t> ret = kvs_->getReplicated(stoul(key, nullptr, 0), sizeof(uint64_t), error);
+        if (!ret.first || ret.second == 0) {
+            error = AnnaError::KEY_DNE;
+            return "";
+        }
         LWWPairLattice<string> val = deserialize_lww(string(ret.first, ret.second));
         if (val.reveal().value == "")
         {
@@ -156,7 +176,11 @@ class MemoryLWWSerializer : public Serializer
     unsigned update(const Key &key, const string &serialized)
     {
         LWWPairLattice<string> val = deserialize_lww(serialized);
+#ifdef DINOMO_NUMA_SERVER
+        return kvs_->update(stoul(key, nullptr, 0), sizeof(uint64_t), serialized.data(), serialized.size());
+#else
         return kvs_->update(stoul(key, nullptr, 0), sizeof(uint64_t), serialized.c_str(), serialized.size() + 1);
+#endif
         //return val.reveal().size();
     }
 

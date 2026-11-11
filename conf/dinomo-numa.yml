@@ -1,0 +1,51 @@
+# One-worker correctness target with metadata IPC and merge-before-ack writes.
+# Logs are not reclaimed; do not use this for performance measurements.
+storage: ./
+capacities: # MiB
+  memory-cap: 16
+  storage-cap: 256
+threads:
+  memory: 1
+  storage: 0
+  routing: 1
+  benchmark: 1
+kvs_config:
+  value-size: 64
+  shortcut-size: 16
+  log-cache-len: 10000000
+  log-block-prealloc-num: 2
+replication:
+  memory: 1
+  storage: 0
+  minimum: 1
+  local: 1
+policy:
+  elasticity: false
+  selective-rep: false
+  tiering: false
+  batching: false
+  batchingthreshold: 5000
+  caching: false
+  adaptive-caching: false
+  weight-or-vratio: 0.5
+  perf-monitoring: false
+  server-report-period: 15
+  server-key-monitor-period: 60
+net_config:
+  request_puller_hwm: 1000
+  request_puller_backlog: 100
+server:
+  public_ip: 127.0.0.1
+  private_ip: 127.0.0.1
+  seed_ip: 127.0.0.1
+  mgmt_ip: "NULL"
+  routing: [127.0.0.1]
+  monitoring: []
+routing:
+  ip: 127.0.0.1
+  monitoring: []
+numa:
+  host-cpu: 2
+  memory-node: 1
+  pool-directory: /dev/shm
+  log-block-bytes: 4096

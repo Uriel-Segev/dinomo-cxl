@@ -6,6 +6,20 @@
 #include <execinfo.h>
 #include "kvs/kvs_handlers.hpp"
 #include "yaml-cpp/yaml.h"
+#ifdef DINOMO_NUMA_SERVER
+#include "kvs/numa_backend.hpp"
+#include <csignal>
+#include <stdexcept>
+#include <unistd.h>
+namespace {
+volatile sig_atomic_t numa_stop_requested = 0;
+void request_numa_stop(int) { numa_stop_requested = 1; }
+std::string numa_config_path = "conf/dinomo-numa.yml";
+std::string numa_pool_path;
+std::string numa_pool_directory;
+int numa_memory_node = 1;
+}
+#endif
 
 // define server report threshold (in second)
 unsigned kServerReportThreshold = 15;
@@ -160,6 +174,14 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
 
     // request server addresses from the seed node
     zmq::socket_t addr_requester(context, ZMQ_REQ);
+#ifdef DINOMO_NUMA_SERVER
+    // Do not let an absent routing process strand the manager indefinitely.
+    int seed_timeout_ms = 10000;
+    int seed_linger_ms = 0;
+    addr_requester.setsockopt(ZMQ_RCVTIMEO, &seed_timeout_ms, sizeof(seed_timeout_ms));
+    addr_requester.setsockopt(ZMQ_SNDTIMEO, &seed_timeout_ms, sizeof(seed_timeout_ms));
+    addr_requester.setsockopt(ZMQ_LINGER, &seed_linger_ms, sizeof(seed_linger_ms));
+#endif
     addr_requester.connect(RoutingThread(seed_ip, 0).seed_connect_address());
     kZmqUtil->send_string("join", &addr_requester);
 
@@ -169,7 +191,15 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
      * diagnostic print. */
     fprintf(stderr, "run<T>[tid=%u] STEP3: waiting for routing response\n", thread_id);
     // receive and add all the addresses that seed node sent
+#ifdef DINOMO_NUMA_SERVER
+    zmq::message_t seed_reply;
+    if (!addr_requester.recv(&seed_reply))
+        throw std::runtime_error("NUMA server: routing seed did not return membership");
+    // An empty protobuf is a valid membership reply for a fresh cluster.
+    string serialized_addresses(static_cast<const char *>(seed_reply.data()), seed_reply.size());
+#else
     string serialized_addresses = kZmqUtil->recv_string(&addr_requester);
+#endif
     /* ADDED: STEP4 progress marker — printed after the routing response is received. Also
      * prints the length of the serialized response so an empty or truncated reply can be
      * detected. All four worker threads printing STEP4 confirms the kvs is fully initialized
@@ -426,7 +456,7 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
     // keep track of key access timestamp
     map<Key, std::multiset<TimePoint>> key_access_tracker;
     // keep track of total access
-    unsigned access_count;
+    unsigned access_count = 0;
 
     // listens for a new node joining
     zmq::socket_t join_puller(context, ZMQ_PULL);
@@ -651,9 +681,27 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
 #endif
 
     // enter event loop
-    while (true)
+#ifdef DINOMO_NUMA_SERVER
+    std::cout << "NUMA server ready: one worker; synchronous merge-before-ack writes" << std::endl;
+#endif
+    while (
+#ifdef DINOMO_NUMA_SERVER
+        !numa_stop_requested
+#else
+        true
+#endif
+    )
     {
+#ifdef DINOMO_NUMA_SERVER
+        try {
+            kZmqUtil->poll(0, &pollitems);
+        } catch (const zmq::error_t &error) {
+            if (numa_stop_requested && error.num() == EINTR) break;
+            throw;
+        }
+#else
         kZmqUtil->poll(0, &pollitems);
+#endif
 
         snapshot = working_time;
 
@@ -1324,7 +1372,11 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
     }
 }
 
+#ifdef DINOMO_NUMA_SERVER
+int server_main(int argc, char *argv[])
+#else
 int main(int argc, char *argv[])
+#endif
 {
     /* ADDED: install a terminate handler that prints a backtrace before aborting. The
      * original code had no terminate handler. In C++, std::terminate() is called when an
@@ -1377,7 +1429,13 @@ int main(int argc, char *argv[])
     kSelfTierIdVector = {kSelfTier};
 
     // read the YAML conf
-    YAML::Node conf = YAML::LoadFile("conf/dinomo-config.yml");
+    YAML::Node conf = YAML::LoadFile(
+#ifdef DINOMO_NUMA_SERVER
+        numa_config_path
+#else
+        "conf/dinomo-config.yml"
+#endif
+    );
     YAML::Node threads = conf["threads"];
     kMemoryThreadCount = threads["memory"].as<unsigned>();
     kStorageThreadCount = threads["storage"].as<unsigned>();
@@ -1389,8 +1447,16 @@ int main(int argc, char *argv[])
     YAML::Node kvsConfig = conf["kvs_config"];
     VALUE_SIZE = kvsConfig["value-size"].as<uint64_t>();
     SHORTCUT_SIZE = kvsConfig["shortcut-size"].as<uint64_t>();
+#ifdef DINOMO_NUMA_SERVER
+    LOG_BLOCK_HEADER_LEN = sizeof(log_block);
+    uint64_t log_block_bytes = conf["numa"]["log-block-bytes"].as<uint64_t>();
+    if (log_block_bytes <= LOG_BLOCK_HEADER_LEN || log_block_bytes > 64 * 1024)
+        throw std::runtime_error("NUMA log blocks must fit the 64 KiB transfer buffer");
+    MAX_LOG_BLOCK_LEN = log_block_bytes - LOG_BLOCK_HEADER_LEN;
+#else
     uint64_t log_block_size = kvsConfig["log-block-size"].as<uint64_t>();
     MAX_LOG_BLOCK_LEN = (log_block_size * 1024 * 1024) - LOG_BLOCK_HEADER_LEN;
+#endif
     kLogCacheLen = kvsConfig["log-cache-len"].as<unsigned>();
     MAX_PREALLOC_NUM = kvsConfig["log-block-prealloc-num"].as<uint64_t>();
 
@@ -1416,6 +1482,7 @@ int main(int argc, char *argv[])
     kReqPullerHWM = net_config["request_puller_hwm"].as<int>();
     kReqPullerBacklog = net_config["request_puller_backlog"].as<int>();
 
+#ifndef DINOMO_NUMA_SERVER
     YAML::Node ib_config = conf["ib_config"];
     int total_available_memory_nodes = ib_config["total_available_memory_nodes"].as<int>();
     int num_initial_memory_nodes = ib_config["num_initial_memory_nodes"].as<int>();
@@ -1454,6 +1521,7 @@ int main(int argc, char *argv[])
     int rank = ib_config["rank"].as<int>();
     bool is_server = false;
 #endif
+#endif
 
     YAML::Node server = conf["server"];
     Address public_ip = server["public_ip"].as<string>();
@@ -1484,19 +1552,46 @@ int main(int argc, char *argv[])
 
 #ifdef ENABLE_DINOMO_KVS
 #ifndef ENABLE_CLOVER_KVS
+#ifdef DINOMO_NUMA_SERVER
+    if (kSelfTier != Tier::MEMORY || kMemoryThreadCount != 1 ||
+        kStorageThreadCount != 0 || kDefaultGlobalMemoryReplication != 1 ||
+        kDefaultGlobalStorageReplication != 0 || kDefaultLocalReplication != 1 ||
+        kEnableCaching || kEnableAdaptiveCache || kEnableBatching ||
+        kEnableElasticity || kEnableSelectiveRep || kEnablePerfMonitor ||
+        mgmt_ip != "NULL")
+        throw std::runtime_error("NUMA server requires one uncached, unbatched memory worker, no replication or management policies, and mgmt_ip NULL");
+    if (MAX_PREALLOC_NUM == 0 || MAX_PREALLOC_NUM > 64 ||
+        MAX_LOG_BLOCK_LEN + LOG_BLOCK_HEADER_LEN > 64 * 1024)
+        throw std::runtime_error("NUMA server requires 1..64 preallocated blocks and log blocks <= 64 KiB");
+    auto numa = conf["numa"];
+    std::string pool_template = numa["pool-directory"].as<std::string>() + "/dinomo-server-XXXXXX";
+    std::vector<char> pool_directory(pool_template.begin(), pool_template.end());
+    pool_directory.push_back('\0');
+    if (!mkdtemp(pool_directory.data()))
+        throw std::runtime_error("Cannot create private NUMA pool directory");
+    numa_pool_directory = pool_directory.data();
+    numa_pool_path = numa_pool_directory + "/pool";
+    numa_memory_node = numa["memory-node"].as<int>();
+    dinomo_numa::start(numa_pool_path, kStorageNodeCapacity,
+                      numa["host-cpu"].as<int>(), numa_memory_node);
+    if (numa_stop_requested) return 0;
+#else
     ib_init(total_available_memory_nodes, num_initial_memory_nodes, 
             num_initial_storage_nodes, threads_per_memory, threads_per_storage,
             num_storage_managers, msg_size, storage_node_ips, sock_port, rank, is_server,
             (uint64_t)(kStorageNodeCapacity));
     //ib_sync_cross(0);
+#endif
 #else
     clover_init(num_initial_memory_nodes, rank, clover_memc_ips);
 #endif
 
+#ifndef DINOMO_NUMA_SERVER
     for (int i = 0; i < num_initial_storage_nodes; i++)
         free(storage_node_ips[i]);
     free(clover_memc_ips[0]);
     free(sock_port);
+#endif
 #endif
 
     // start the initial threads based on kThreadNum
@@ -1509,6 +1604,9 @@ int main(int argc, char *argv[])
     run<MemoryLWWKVS>(0, public_ip, private_ip, seed_ip, routing_ips, monitoring_ips, mgmt_ip);
 #else
 #ifndef ENABLE_CLOVER_KVS
+#ifdef DINOMO_NUMA_SERVER
+    run<DinomoECKVS>(0, public_ip, private_ip, seed_ip, routing_ips, monitoring_ips, mgmt_ip);
+#else
     if (kEnableCaching) {
         if (kEnableAdaptiveCache) {
             for (unsigned thread_id = 1; thread_id < kThreadNum; thread_id++) {
@@ -1530,6 +1628,7 @@ int main(int argc, char *argv[])
         }
         run<DinomoECKVS>(0, public_ip, private_ip, seed_ip, routing_ips, monitoring_ips, mgmt_ip);
     }
+#endif
 #else
     for (unsigned thread_id = 1; thread_id < kThreadNum; thread_id++) {
         worker_threads.push_back(std::thread(run<CloverKVS>, thread_id, public_ip, private_ip,
@@ -1547,9 +1646,49 @@ int main(int argc, char *argv[])
 
 #ifdef ENABLE_DINOMO_KVS
 #ifndef ENABLE_CLOVER_KVS
+#ifndef DINOMO_NUMA_SERVER
     ib_finalize();
+#endif
 #endif
 #endif
 
     return 0;
 }
+
+#ifdef DINOMO_NUMA_SERVER
+int main(int argc, char *argv[])
+{
+    if (argc > 2) {
+        std::cerr << "Usage: " << argv[0] << " [NUMA_CONFIG.yml]\n";
+        return 2;
+    }
+    if (argc == 2) numa_config_path = argv[1];
+    struct sigaction action{};
+    action.sa_handler = request_numa_stop;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+    int result = 0;
+    try {
+        result = server_main(1, argv);
+        if (!numa_pool_path.empty()) dinomo_numa::verify_placement(numa_memory_node);
+    } catch (const std::exception &error) {
+        std::cerr << "NUMA server failed: " << error.what() << '\n';
+        result = 1;
+    }
+    try { dinomo_numa::stop(); }
+    catch (const std::exception &error) {
+        std::cerr << "NUMA cleanup failed: " << error.what() << '\n';
+        result = 1;
+    }
+    if (!numa_pool_path.empty() && unlink(numa_pool_path.c_str()) != 0 && errno != ENOENT) {
+        std::cerr << "NUMA pool cleanup failed\n";
+        result = 1;
+    }
+    if (!numa_pool_directory.empty() && rmdir(numa_pool_directory.c_str()) != 0) {
+        std::cerr << "NUMA directory cleanup failed\n";
+        result = 1;
+    }
+    return result;
+}
+#endif

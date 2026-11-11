@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <fcntl.h>
 #include <linux/mempolicy.h>
 #include <sched.h>
@@ -15,23 +17,31 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 
 ConfigInfo config_info{};
 IBRes ib_res{};
 clht_t *farIdx = nullptr;
+#ifndef DINOMO_NUMA_SERVER
 uint64_t VALUE_SIZE = 64, SHORTCUT_SIZE = 16;
 uint64_t MAX_LOG_BLOCK_LEN = 4096, MAX_PREALLOC_NUM = 2;
 uint64_t LOG_BLOCK_HEADER_LEN = sizeof(log_block);
+#endif
 tbb::concurrent_queue<uint64_t> *reserved_alloc_queue = nullptr;
 std::list<bloomFilter *> *filterList = nullptr;
+#ifndef DINOMO_NUMA_SERVER
 unsigned kLogCacheLen = 10000000;
+#endif
 FILE *log_fp = stderr;
 
 namespace {
-enum Command : uint64_t { Allocate = 1, Merge = 2, Quit = 3 };
+enum Command : uint64_t { Allocate = 1, Merge = 2, Quit = 3, PutMetadata = 4, GetMetadata = 5 };
+constexpr size_t metadata_capacity = 64 * 1024;
 struct Message {
     uint64_t command = 0, count = 0, base = 0, root = 0, ok = 1;
     uint64_t addresses[64]{};
+    uint64_t key_size = 0, value_size = 0, found = 0;
+    char data[metadata_capacity]{};
 };
 int control = -1;
 pid_t manager = -1;
@@ -39,6 +49,7 @@ char *mapping = nullptr;
 size_t mapping_size = 0;
 uint64_t remote_base = 0;
 uint64_t reads = 0, writes = 0, allocations = 0;
+uint64_t metadata_reads = 0, metadata_writes = 0;
 ibv_mr local_mr{};
 ibv_qp *local_qps[1]{};
 ibv_cq *local_cqs[1]{};
@@ -113,6 +124,9 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
         // All PMDK allocator calls stay on this single manager thread.
         // The compute process only transfers bytes to allocated log blocks.
         std::vector<uint64_t> logs;
+        // Volatile metadata, like the original storage metadata store. This
+        // allocation follows the host-local policy restored after pool creation.
+        std::map<std::string, std::string> metadata;
         for (;;) {
             Message message;
             exchange_bytes(fd, &message, sizeof(message), false);
@@ -163,7 +177,21 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
                     block->merged_offset.store(position);
                 }
             } else {
-                throw std::runtime_error("Unsupported NUMA control command");
+                if (message.command != PutMetadata && message.command != GetMetadata)
+                    throw std::runtime_error("Unsupported NUMA control command");
+                require(message.key_size > 0 && message.key_size <= metadata_capacity &&
+                        message.value_size <= metadata_capacity - message.key_size,
+                        "Metadata request exceeds IPC capacity");
+                std::string key(message.data, message.key_size);
+                if (message.command == PutMetadata) {
+                    metadata[key] = std::string(message.data + message.key_size, message.value_size);
+                } else {
+                    auto entry = metadata.find(key);
+                    message.found = entry != metadata.end();
+                    message.value_size = message.found ? entry->second.size() : 0;
+                    if (message.found)
+                        memcpy(message.data, entry->second.data(), message.value_size);
+                }
             }
             exchange_bytes(fd, &message, sizeof(message), true);
         }
@@ -206,6 +234,8 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node)
     manager = fork();
     require(manager >= 0, "fork storage manager");
     if (manager == 0) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
         close(sockets[0]);
         serve(sockets[1], path, bytes, cpu, memory_node);
     }
@@ -251,6 +281,7 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node)
 
 void allocate_logs(uint64_t *addresses, size_t count)
 {
+    require(count > 0 && count <= 64, "Allocation batch must be between 1 and 64");
     Message message;
     message.command = Allocate;
     message.count = count;
@@ -267,6 +298,34 @@ void merge_logs()
     message.command = Merge;
     (void)request(message);
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void put_metadata(const char *key, size_t key_size, const void *value, size_t value_size)
+{
+    require(key && key_size > 0 && key_size <= metadata_capacity &&
+            value_size <= metadata_capacity - key_size && (value || value_size == 0),
+            "Invalid NUMA metadata write");
+    Message message;
+    message.command = PutMetadata;
+    message.key_size = key_size;
+    message.value_size = value_size;
+    memcpy(message.data, key, key_size);
+    if (value_size) memcpy(message.data + key_size, value, value_size);
+    (void)request(message);
+    ++metadata_writes;
+}
+
+std::pair<bool, std::string> get_metadata(const char *key, size_t key_size)
+{
+    require(key && key_size > 0 && key_size <= metadata_capacity, "Invalid NUMA metadata key");
+    Message message;
+    message.command = GetMetadata;
+    message.key_size = key_size;
+    memcpy(message.data, key, key_size);
+    message = request(message);
+    require(message.value_size <= metadata_capacity, "Invalid NUMA metadata reply");
+    ++metadata_reads;
+    return {message.found != 0, std::string(message.data, message.value_size)};
 }
 
 void verify_placement(int expected_node)
@@ -297,6 +356,10 @@ uint64_t allocation_count() { return allocations; }
 
 void stop()
 {
+    if (mapping && mapping != MAP_FAILED)
+        fprintf(stdout, "NUMA counters: shared_reads=%lu shared_writes=%lu allocated_logs=%lu metadata_gets=%lu metadata_puts=%lu\n",
+                reads, writes, allocations, metadata_reads, metadata_writes);
+    bool manager_ok = true;
     if (control >= 0) {
         Message quit;
         quit.command = Quit;
@@ -306,10 +369,22 @@ void stop()
     }
     if (manager > 0) {
         int status = 0;
-        waitpid(manager, &status, 0);
+        pid_t reaped = 0;
+        // Cleanup must finish even if the manager is stuck in a request.
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            reaped = waitpid(manager, &status, WNOHANG);
+            if (reaped == manager || (reaped < 0 && errno != EINTR)) break;
+            timespec pause{0, 50 * 1000 * 1000};
+            nanosleep(&pause, nullptr);
+        }
+        bool forced = reaped == 0 || (reaped < 0 && errno == EINTR);
+        if (forced) {
+            kill(manager, SIGKILL);
+            do { reaped = waitpid(manager, &status, 0); }
+            while (reaped < 0 && errno == EINTR);
+        }
         manager = -1;
-        require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                "NUMA manager failed");
+        manager_ok = !forced && reaped > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
     if (mapping && mapping != MAP_FAILED)
         munmap(mapping, mapping_size);
@@ -317,6 +392,7 @@ void stop()
     free(ib_res.ib_buf);
     free(ib_res.ib_pool);
     ib_res.ib_buf = ib_res.ib_pool = nullptr;
+    require(manager_ok, "NUMA manager failed");
 }
 }
 
@@ -354,4 +430,18 @@ int post_send_imm_profile(uint32_t, uint32_t, uint64_t, uint32_t,
 {
     throw std::runtime_error("Unsupported SEND path in one-worker NUMA milestone");
 }
+#ifdef DINOMO_NUMA_SERVER
+int post_cas_signaled_blocking_profile(uint32_t, uint32_t, uint64_t,
+        ibv_qp *, char *, uint64_t, uint32_t, ibv_cq *, uint64_t, uint64_t,
+        uint64_t *, uint64_t *)
+{
+    throw std::runtime_error("CAS/replication is unsupported by the NUMA server");
+}
+int post_fetch_add_signaled_blocking_profile(uint32_t, uint32_t, uint64_t,
+        ibv_qp *, char *, uint64_t, uint32_t, ibv_cq *, uint64_t,
+        uint64_t *, uint64_t *)
+{
+    throw std::runtime_error("Fetch-add/replication is unsupported by the NUMA server");
+}
+#endif
 }

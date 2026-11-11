@@ -37,6 +37,23 @@ if (NOT CLOVER_KVS_COMPILE)
         atomic pmemobj pmem boost_system boost_thread ibverbs rdmacm)
     ADD_DEPENDENCIES(dinomo-kvs hydro-zmq zeromq zeromqcpp)
 
+    option(BUILD_NUMA_SERVER "Build the experimental one-worker NUMA server" OFF)
+    if (BUILD_NUMA_SERVER)
+        if (SHARED_NOTHING_KVS_COMPILE)
+            message(FATAL_ERROR "The NUMA server requires the shared-storage build")
+        endif()
+        set(NUMA_SERVER_SOURCE ${KVS_SOURCE})
+        list(REMOVE_ITEM NUMA_SERVER_SOURCE dinomo_compute.cpp ib.cpp ib_config.cpp setup_ib.cpp sock.cpp)
+        add_executable(dinomo-kvs-numa ${NUMA_SERVER_SOURCE} numa_backend.cpp)
+        set_property(TARGET dinomo-kvs-numa PROPERTY CXX_STANDARD 17)
+        target_compile_definitions(dinomo-kvs-numa PRIVATE DINOMO_NUMA_MILESTONE DINOMO_NUMA_SERVER)
+        target_compile_options(dinomo-kvs-numa PRIVATE -mcx16)
+        target_link_libraries(dinomo-kvs-numa anna-hash-ring ${KV_LIBRARY_DEPENDENCIES}
+            ${JemallocLib} ${TbbLib} ${CMAKE_SOURCE_DIR}/src/kvs/libbloom/build/libbloom.so
+            atomic pmemobj pmem boost_system boost_thread ibverbs)
+        add_dependencies(dinomo-kvs-numa hydro-zmq zeromq zeromqcpp)
+    endif()
+
     if (SHARED_NOTHING_KVS_COMPILE)
         SET(KVS_STORAGE_SOURCE
             dpm.cpp

@@ -21,7 +21,7 @@ all: build/dinomo-numa-milestone
 build:
 	mkdir -p build
 
-build/milestone.o: milestone.cpp $(ROOT)/include/kvs/dinomo_compute.hpp | build
+build/milestone.o: milestone.cpp $(ROOT)/include/kvs/dinomo_compute.hpp $(ROOT)/include/kvs/numa_backend.hpp | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 build/numa_backend.o: $(ROOT)/src/kvs/numa_backend.cpp $(ROOT)/include/kvs/numa_backend.hpp | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
@@ -40,5 +40,10 @@ build/murmur.o: $(BLOOM)/murmur2/MurmurHash2.c | build
 build/dinomo-numa-milestone: $(OBJECTS)
 	$(CXX) $(CXXFLAGS) -Wl,--gc-sections $^ $(LDLIBS) -o $@
 
+build/gc_check.o: gc_check.cpp $(ROOT)/include/kvs/dinomo_compute.hpp $(ROOT)/include/kvs/numa_backend.hpp | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+build/dinomo-numa-gc-check: build/gc_check.o $(filter-out build/milestone.o,$(OBJECTS))
+	$(CXX) $(CXXFLAGS) -Wl,--gc-sections $^ $(LDLIBS) -o $@
+
 clean:
-	rm -f build/*.o build/dinomo-numa-milestone
+	rm -f build/*.o build/dinomo-numa-milestone build/dinomo-numa-gc-check

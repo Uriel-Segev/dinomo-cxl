@@ -270,11 +270,11 @@ their serialized LWW envelope, must fit one log block after its record header
 (the configuration uses 4 KiB total log blocks). Oversized requests fail
 explicitly. Missing results are handled before LWW deserialization.
 
-Merge-before-ack retires a log for every write and the current allocator
-requests fresh batches, so space use is intentionally inefficient. Logs are
-not reclaimed. This is a bounded correctness configuration, not a sustained
-workload or performance configuration. The standalone milestone still tests
-capacity-driven log rollover separately.
+Merge-before-ack retires a log for every write. The NUMA server now recycles
+unreferenced logs after an explicit compute release, as described in milestone
+3 below. This remains a synchronous single-worker correctness configuration,
+not a performance configuration. The standalone baseline still tests
+capacity-driven rollover separately and defaults to reclamation disabled.
 
 ### Validation on c8220
 
@@ -284,7 +284,7 @@ The 256-key network test passed for:
 - A remote node 1 pool with all 20 node 1 logical CPUs offline:
   `results/server-startup-9n624dqy`.
 
-Both runs verified 256/256 sampled pool pages on the requested node at startup
+These pre-reclamation baseline runs verified 256/256 sampled pool pages on the requested node at startup
 and shutdown. Each recorded 5,895 shared reads, 3,073 shared writes, 1,536
 allocated log blocks, four metadata GETs, and two metadata PUTs.
 The remote runner restored CPUs afterward. The standalone 1,000-key local
@@ -297,16 +297,42 @@ restoration checks; evidence is in
 The initial source audit and implementation notes are in
 [NETWORK_INTEGRATION_AUDIT.md](NETWORK_INTEGRATION_AUDIT.md).
 
-## Later milestones, after network correctness
+## Milestone 3: synchronous single-worker log reclamation
+
+The manager now tracks index references and compute allocation leases.
+After merge, compute clears staging, caches, spare addresses, and its published
+log chain before explicitly releasing grants. Only zero-reference, unleased
+blocks can be reset and reused. This prevents reuse of a block that still
+holds a cold value or remains accessible through compute-local state.
+
+~~~bash
+cd ~/dinomo-cxl
+./numa-test/dinomo/run_gc_core_test.sh
+MEMORY_NODE=0 ./numa-test/dinomo/run_gc_test.sh --no-offline
+./numa-test/dinomo/run_gc_test.sh
+~~~
+
+The network stress passed with local and remote memory-only 16 MiB pools.
+It wrote about 20 MiB of update values and granted about 65 MiB of logical log
+space while fresh allocation stayed at 34 objects. The same workload with
+reuse disabled exhausted PMDK as expected. The original standalone milestone
+still passes. Remote pool CPUs were restored after testing.
+
+See [LOG_RECLAMATION.md](LOG_RECLAMATION.md) for ownership rules, exact counters,
+commands, the no-reclamation control, and saved evidence. This does not add
+continuous/background merge, multiple workers, partial-block compaction, or
+recovery.
+
+## Later milestones
 
 1. Add multiple workers with per-worker staging and IPC ownership. Define CPU
    atomic access, publication ordering, allocator ownership, and reclamation
    rules before allowing concurrent access to shared metadata. Stress repeated
    updates to the same keys and hash-bucket collisions.
-2. Implement continuous merge and safe reclamation. The current manager merges
-   on request and never reclaims allocated logs; sustained runs would exhaust
-   the pool. Demonstrate a workload larger than available log capacity without
-   stale reads or use-after-free.
+2. Introduce continuous merge with reader protection and safe reclamation
+   across overlapping operations. Current reuse is safe only at explicit
+   synchronous single-worker release points. Consider compaction of partially
+   live blocks separately.
 3. Integrate the existing benchmark client and report actual end-to-end GET
    and UPDATE throughput plus median/p99 latency. The current run_dinomo_test.sh
    still invokes the five-VM harness and must be adapted to select the new

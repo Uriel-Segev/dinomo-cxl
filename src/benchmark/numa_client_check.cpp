@@ -56,9 +56,14 @@ static void read(KvsClient &client, const std::string &key, const std::string &e
 int main(int argc, char **argv)
 {
     try {
-        const unsigned keys = argc == 2 ? std::stoul(argv[1]) : 256;
-        if (argc > 2 || keys < 1 || keys > 2000)
-            throw std::runtime_error("Usage: dinomo-numa-client-check [NUM_KEYS:1..2000]");
+        const unsigned keys = argc >= 2 ? std::stoul(argv[1]) : 256;
+        const unsigned rounds = argc == 3 ? std::stoul(argv[2]) : 0;
+        if (argc > 3 || keys < 1 || keys > 2000 || rounds > 4096 || (rounds && keys % 2))
+            throw std::runtime_error("Usage: dinomo-numa-client-check [NUM_KEYS:1..2000] [GC_ROUNDS:0..4096; even keys]");
+        auto key_name = [rounds](unsigned key) {
+            // Collide in the initial CLHT table when stressing reclamation.
+            return std::to_string(rounds ? 1 + 1024UL * (key - 1) : key);
+        };
         kTierMetadata[Tier::MEMORY] = TierMetadata(Tier::MEMORY, 1, 1, 16 * 1024 * 1024);
         kTierMetadata[Tier::STORAGE] = TierMetadata(Tier::STORAGE, 0, 0, 256 * 1024 * 1024);
         KvsClient client({UserRoutingThread("127.0.0.1", 0)}, "127.0.0.1", 0, 2000, false);
@@ -75,7 +80,7 @@ int main(int argc, char **argv)
         // Every acknowledgement is followed by a GET through the existing
         // client API; the harness never sends merge or clears worker staging.
         for (unsigned key = 1; key <= keys; ++key) {
-            const std::string name = std::to_string(key);
+            const std::string name = key_name(key);
             const std::string first(64, 'a' + key % 26);
             const std::string second(257, 'A' + key % 26);
             const std::string third("latest\0binary", 13);
@@ -88,7 +93,29 @@ int main(int argc, char **argv)
         }
         // Revisit earlier keys after many allocation batches and merge cycles.
         for (unsigned key = 1; key <= keys; ++key)
-            read(client, std::to_string(key), std::string("latest\0binary", 13));
+            read(client, key_name(key), std::string("latest\0binary", 13));
+        if (rounds) {
+            std::vector<std::string> values(keys + 1, std::string("latest\0binary", 13));
+            uint64_t bytes = 0;
+            for (unsigned round = 0; round < rounds; ++round) {
+                for (unsigned key = keys / 2 + 1; key <= keys; ++key) {
+                    values[key] = std::string(2048 + (round % 3) * 512, 'A' + key % 26);
+                    const auto generation = std::to_string(round) + ":" + std::to_string(key);
+                    values[key].replace(0, generation.size(), generation);
+                    values[key][32] = '\0';
+                    write(client, key_name(key), values[key], timestamp++, true);
+                    bytes += values[key].size();
+                    read(client, key_name(key), values[key]);
+                }
+                // Cold values must survive reuse of thousands of hot records.
+                if (round % 8 == 0)
+                    for (unsigned key = 1; key <= keys; ++key)
+                        read(client, key_name(key), values[key]);
+            }
+            for (unsigned key = 1; key <= keys; ++key) read(client, key_name(key), values[key]);
+            std::cout << "GC_WORKLOAD: update_bytes=" << bytes << " rounds=" << rounds
+                      << " hot_keys=" << keys / 2 << '\n';
+        }
         read(client, "99999999", "", true);
         read(client, meta, binary_meta);
         std::cout << "PASS: existing KvsClient; " << keys

@@ -35,13 +35,14 @@ unsigned kLogCacheLen = 10000000;
 FILE *log_fp = stderr;
 
 namespace {
-enum Command : uint64_t { Allocate = 1, Merge = 2, Quit = 3, PutMetadata = 4, GetMetadata = 5 };
+enum Command : uint64_t { Allocate = 1, Merge = 2, Quit = 3, PutMetadata = 4, GetMetadata = 5, Release = 6, Stats = 7 };
 constexpr size_t metadata_capacity = 64 * 1024;
 struct Message {
     uint64_t command = 0, count = 0, base = 0, root = 0, ok = 1;
     uint64_t addresses[64]{};
     uint64_t key_size = 0, value_size = 0, found = 0;
     char data[metadata_capacity]{};
+    dinomo_numa::LogStats logs;
 };
 int control = -1;
 pid_t manager = -1;
@@ -50,6 +51,8 @@ size_t mapping_size = 0;
 uint64_t remote_base = 0;
 uint64_t reads = 0, writes = 0, allocations = 0;
 uint64_t metadata_reads = 0, metadata_writes = 0;
+bool reclaim_enabled = false;
+dinomo_numa::LogStats latest_log_stats;
 ibv_mr local_mr{};
 ibv_qp *local_qps[1]{};
 ibv_cq *local_cqs[1]{};
@@ -81,6 +84,7 @@ Message request(Message message)
     exchange_bytes(control, &message, sizeof(message), true);
     exchange_bytes(control, &message, sizeof(message), false);
     require(message.ok == 1, "NUMA manager rejected request");
+    latest_log_stats = message.logs;
     return message;
 }
 
@@ -103,7 +107,8 @@ void *translate(uint64_t address, size_t length)
     return mapping + offset;
 }
 
-void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
+void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
+           bool reclaim, size_t block_limit)
 {
     try {
         dinomo_numa::pin_cpu(cpu);
@@ -124,6 +129,12 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
         // All PMDK allocator calls stay on this single manager thread.
         // The compute process only transfers bytes to allocated log blocks.
         std::vector<uint64_t> logs;
+        struct BlockState { uint64_t live = 0; bool leased = true, available = false; };
+        struct Reference { uint64_t record, block; };
+        std::map<uint64_t, BlockState> blocks;
+        std::map<uint64_t, Reference> references;
+        std::vector<uint64_t> available;
+        dinomo_numa::LogStats stats;
         // Volatile metadata, like the original storage metadata store. This
         // allocation follows the host-local policy restored after pool creation.
         std::map<std::string, std::string> metadata;
@@ -136,11 +147,30 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
                 require(message.count > 0 && message.count <= 64,
                         "Invalid allocation batch");
                 for (size_t i = 0; i < message.count; ++i) {
-                    PMEMoid oid;
-                    require(pmemobj_zalloc(pop, &oid,
-                            sizeof(log_block) + MAX_LOG_BLOCK_LEN, 0) == 0,
-                            "Allocate PMDK log block");
+                    PMEMoid oid{pool_uuid, 0};
+                    if (reclaim && !available.empty()) {
+                        oid.off = available.back();
+                        available.pop_back();
+                        auto &state = blocks.at(oid.off);
+                        require(state.available && !state.leased && state.live == 0,
+                                "Attempt to reuse a referenced or leased log");
+                        state.available = false;
+                        state.leased = true;
+                        ++stats.reused_blocks;
+                    } else {
+                        require(block_limit == 0 || blocks.size() < block_limit,
+                                "NUMA fresh log block limit reached");
+                        require(pmemobj_zalloc(pop, &oid,
+                                sizeof(log_block) + MAX_LOG_BLOCK_LEN, 0) == 0,
+                                "Allocate PMDK log block");
+                        blocks.emplace(oid.off, BlockState{});
+                        ++stats.fresh_blocks;
+                    }
                     auto *block = static_cast<log_block *>(pmemobj_direct(oid));
+                    // No index reference, staging reference, spare allocation,
+                    // or log-chain reference may survive reuse. The manager is
+                    // the only allocator and the compute worker is synchronous.
+                    memset(block->buffer, 0, MAX_LOG_BLOCK_LEN);
                     new (&block->merged_offset) std::atomic<uint32_t>(0);
                     new (&block->offset) std::atomic<uint32_t>(0);
                     new (&block->valid_counter) std::atomic<uint64_t>(0);
@@ -153,6 +183,8 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
             } else if (message.command == Merge) {
                 // Allocation order is log order for this one-worker milestone.
                 for (uint64_t offset : logs) {
+                    require(blocks.at(offset).leased && !blocks.at(offset).available,
+                            "Merge encountered an unleased log");
                     auto *block = static_cast<log_block *>(
                         pmemobj_direct(PMEMoid{pool_uuid, offset}));
                     uint32_t position = block->merged_offset.load();
@@ -169,13 +201,49 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
                                 "Unsupported operation in NUMA milestone");
                         uint64_t record_offset = pmemobj_oid(record).off;
                         uint64_t old = clht_update(farIdx, record->key, record_offset);
-                        if (!old)
+                        auto previous = references.find(record->key);
+                        if (previous != references.end()) {
+                            require(old == previous->second.record && old != 0,
+                                    "Index/log ownership mismatch");
+                            auto &owner = blocks.at(previous->second.block);
+                            require(owner.live > 0, "Log reference count underflow");
+                            --owner.live;
+                        } else {
+                            require(old == 0, "Untracked index reference");
                             require(clht_put(farIdx, record->key, record_offset) != 0,
                                     "CLHT insert failed");
+                        }
+                        ++blocks.at(offset).live;
+                        references[record->key] = {record_offset, offset};
                         position += sizeof(oplogs) + record->val_len;
                     }
                     block->merged_offset.store(position);
                 }
+            } else if (message.command == Release) {
+                require(reclaim, "Log release requires reclamation mode");
+                auto *head = static_cast<uint64_t *>(pmemobj_direct(
+                    PMEMoid{pool_uuid, farIdx->log_table_addr}));
+                require(*head == 0, "Compute still publishes a log chain");
+                // Release is a quiescent point: the one compute worker has
+                // cleared all local references and is blocked on this reply.
+                for (uint64_t offset : logs) {
+                    auto *block = static_cast<log_block *>(pmemobj_direct(PMEMoid{pool_uuid, offset}));
+                    require(block->merged_offset.load() == block->offset.load(),
+                            "Cannot release an unmerged log");
+                    blocks.at(offset).leased = false;
+                    block->next.store(0);
+                }
+                logs.clear();
+                for (auto &entry : blocks) {
+                    auto &state = entry.second;
+                    if (state.live == 0 && !state.leased && !state.available) {
+                        state.available = true;
+                        available.push_back(entry.first);
+                        ++stats.reclaimed_blocks;
+                    }
+                }
+            } else if (message.command == Stats) {
+                // Reply below includes the manager's current ownership counts.
             } else {
                 if (message.command != PutMetadata && message.command != GetMetadata)
                     throw std::runtime_error("Unsupported NUMA control command");
@@ -193,6 +261,15 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node)
                         memcpy(message.data, entry->second.data(), message.value_size);
                 }
             }
+            stats.live_blocks = stats.leased_blocks = stats.live_records = 0;
+            stats.free_blocks = available.size();
+            for (const auto &entry : blocks) {
+                stats.live_blocks += entry.second.live != 0;
+                stats.leased_blocks += entry.second.leased;
+                stats.live_records += entry.second.live;
+            }
+            require(stats.live_records == references.size(), "Index reference accounting mismatch");
+            message.logs = stats;
             exchange_bytes(fd, &message, sizeof(message), true);
         }
         pmemobj_close(pop);
@@ -219,9 +296,11 @@ void pin_cpu(int cpu)
             "Pin process to host CPU");
 }
 
-void start(const std::string &path, size_t bytes, int cpu, int memory_node)
+void start(const std::string &path, size_t bytes, int cpu, int memory_node,
+           bool reclaim_logs, size_t block_limit)
 {
     require(manager == -1, "NUMA backend already started");
+    reclaim_enabled = reclaim_logs;
     pin_cpu(cpu);
     int sockets[2];
     require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
@@ -237,7 +316,7 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node)
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
         close(sockets[0]);
-        serve(sockets[1], path, bytes, cpu, memory_node);
+        serve(sockets[1], path, bytes, cpu, memory_node, reclaim_logs, block_limit);
     }
     close(sockets[1]);
     control = sockets[0];
@@ -300,6 +379,24 @@ void merge_logs()
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
+bool reclamation_enabled() { return reclaim_enabled; }
+
+void release_logs()
+{
+    require(reclaim_enabled, "Reclamation is disabled");
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    Message message;
+    message.command = Release;
+    (void)request(message);
+}
+
+LogStats log_stats()
+{
+    Message message;
+    message.command = Stats;
+    return request(message).logs;
+}
+
 void put_metadata(const char *key, size_t key_size, const void *value, size_t value_size)
 {
     require(key && key_size > 0 && key_size <= metadata_capacity &&
@@ -359,6 +456,12 @@ void stop()
     if (mapping && mapping != MAP_FAILED)
         fprintf(stdout, "NUMA counters: shared_reads=%lu shared_writes=%lu allocated_logs=%lu metadata_gets=%lu metadata_puts=%lu\n",
                 reads, writes, allocations, metadata_reads, metadata_writes);
+    if (mapping && mapping != MAP_FAILED)
+        fprintf(stdout, "NUMA GC: enabled=%d fresh_blocks=%lu reused_blocks=%lu reclaimed_blocks=%lu live_blocks=%lu free_blocks=%lu leased_blocks=%lu live_records=%lu logical_log_bytes=%lu\n",
+                reclaim_enabled, latest_log_stats.fresh_blocks, latest_log_stats.reused_blocks,
+                latest_log_stats.reclaimed_blocks, latest_log_stats.live_blocks,
+                latest_log_stats.free_blocks, latest_log_stats.leased_blocks,
+                latest_log_stats.live_records, allocations * (sizeof(log_block) + MAX_LOG_BLOCK_LEN));
     bool manager_ok = true;
     if (control >= 0) {
         Message quit;

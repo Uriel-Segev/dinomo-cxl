@@ -28,7 +28,16 @@ def main():
     parser.add_argument("--client-check", action="store_true", help="Run existing-client network correctness checks")
     parser.add_argument("--keys", type=int, default=256)
     parser.add_argument("--require-offline", action="store_true")
+    parser.add_argument("--gc-rounds", type=int, default=0)
+    parser.add_argument("--pool-mb", type=int, default=256)
+    parser.add_argument("--log-block-limit", type=int, default=0)
+    parser.add_argument("--no-reclaim", action="store_true")
+    parser.add_argument("--expect-exhaustion", action="store_true")
     args = parser.parse_args()
+    if args.expect_exhaustion and not (args.client_check and args.no_reclaim and args.gc_rounds and args.log_block_limit == 0):
+        parser.error("Expected exhaustion requires a GC workload, --no-reclaim, and no block limit")
+    if not 16 <= args.pool_mb <= 4096 or args.log_block_limit < 0 or not 0 <= args.gc_rounds <= 4096:
+        parser.error("Invalid pool size, block limit, or GC round count")
     root = Path(__file__).resolve().parents[2]
     build = (root / args.build_dir).resolve()
     server_binary = build / "target/kvs/dinomo-kvs-numa"
@@ -51,6 +60,9 @@ def main():
     config = (root / "conf/dinomo-numa.yml").read_text()
     config = config.replace("host-cpu: 2", f"host-cpu: {args.host_cpu}")
     config = config.replace("memory-node: 1", f"memory-node: {args.memory_node}")
+    config = config.replace("storage-cap: 256", f"storage-cap: {args.pool_mb}")
+    config = config.replace("log-block-limit: 0", f"log-block-limit: {args.log_block_limit}")
+    if args.no_reclaim: config = config.replace("reclaim-logs: true", "reclaim-logs: false")
     # Keep private pool directories under an owned evidence subdirectory, so
     # cleanup can be verified without inspecting another user's resources.
     pool_root = Path(tempfile.mkdtemp(prefix="dinomo-startup-", dir="/dev/shm"))
@@ -106,38 +118,69 @@ def main():
             wait_for(server, evidence / "server.log", "NUMA server ready:")
             if route.poll() is not None:
                 raise RuntimeError("Routing process failed")
+            children = Path(f"/proc/{server.pid}/task/{server.pid}/children").read_text().split()
+            if len(children) != 1:
+                raise RuntimeError(f"Expected one manager child, found {children}")
             if args.client_check:
                 client_directory = evidence / "client"
                 client_directory.mkdir()
                 with (evidence / "client.log").open("w") as client_output:
                     client = subprocess.Popen(
-                        ["taskset", "-c", str(args.host_cpu), str(client_binary), str(args.keys)],
+                        ["taskset", "-c", str(args.host_cpu), str(client_binary), str(args.keys), str(args.gc_rounds)],
                         cwd=client_directory, stdout=client_output, stderr=client_output)
                     processes.append(client)
-                    if client.wait(timeout=180) != 0:
+                    deadline = time.monotonic() + 180
+                    while client.poll() is None and time.monotonic() < deadline:
+                        if server.poll() is not None:
+                            if not args.expect_exhaustion:
+                                raise RuntimeError("Server exited during workload: " + (evidence / "server.log").read_text()[-4000:])
+                            client.terminate()
+                            client.wait(timeout=15)
+                            break
+                        time.sleep(0.05)
+                    if client.poll() is None:
+                        raise RuntimeError("Client exceeded workload deadline")
+                    if client.returncode != 0 and not args.expect_exhaustion:
                         raise RuntimeError("Client correctness failed: " + (evidence / "client.log").read_text())
-            children = Path(f"/proc/{server.pid}/task/{server.pid}/children").read_text().split()
-            if len(children) != 1:
-                raise RuntimeError(f"Expected one manager child, found {children}")
-            server.send_signal(signal.SIGTERM)
-            if server.wait(timeout=15) != 0:
-                raise RuntimeError("Server did not shut down successfully")
+            if args.expect_exhaustion:
+                if client.returncode == 0 or server.wait(timeout=15) == 0 or "Allocate PMDK log block" not in (evidence / "server.log").read_text():
+                    raise RuntimeError("No-reclamation control did not exhaust the PMDK pool as expected")
+            else:
+                server.send_signal(signal.SIGTERM)
+                if server.wait(timeout=15) != 0:
+                    raise RuntimeError("Server did not shut down successfully")
             if any(Path(f"/proc/{pid}").exists() for pid in children):
                 raise RuntimeError("Manager survived server shutdown")
         if list(pool_root.iterdir()):
             raise RuntimeError("Server shutdown left a pool behind")
-        if args.client_check:
+        if args.client_check and not args.expect_exhaustion:
             server_text = (evidence / "server.log").read_text()
             counters = re.search(r"NUMA counters: shared_reads=(\d+) shared_writes=(\d+) allocated_logs=(\d+) metadata_gets=(\d+) metadata_puts=(\d+)", server_text)
             if not counters or any(int(value) == 0 for value in counters.groups()):
                 raise RuntimeError("Expected shared-pool, allocation, and metadata operations")
             if args.keys >= 10 and int(counters.group(3)) <= 2:
                 raise RuntimeError("Workload did not exercise repeated allocation batches")
+            if args.gc_rounds:
+                gc = re.search(r"NUMA GC: enabled=1 fresh_blocks=(\d+) reused_blocks=(\d+) reclaimed_blocks=(\d+) live_blocks=(\d+) free_blocks=(\d+) leased_blocks=(\d+) live_records=(\d+) logical_log_bytes=(\d+)", server_text)
+                if not gc:
+                    raise RuntimeError("Missing reclamation evidence")
+                fresh, reused, reclaimed, live, free, leased, records, logical_bytes = map(int, gc.groups())
+                if not reused or not reclaimed or leased or records != args.keys or fresh != live + free:
+                    raise RuntimeError("Reclamation ownership/count checks failed")
+                if args.log_block_limit and fresh > args.log_block_limit:
+                    raise RuntimeError("Physical log count exceeded the configured bound")
+                workload = re.search(r"GC_WORKLOAD: update_bytes=(\d+)", (evidence / "client.log").read_text())
+                if logical_bytes <= args.pool_mb * 1024 * 1024 or not workload or int(workload.group(1)) <= args.pool_mb * 1024 * 1024:
+                    raise RuntimeError("Workload did not exceed pool capacity")
             if args.require_offline and Path(
                     f"/sys/devices/system/node/node{args.memory_node}/cpulist").read_text().strip():
                 raise RuntimeError("Pool CPUs came online during the workload")
         (evidence / "PASS").write_text("Config rejection, startup, missing seed, SIGTERM, manager and pool cleanup passed.\n")
-        if args.client_check:
+        if args.expect_exhaustion:
+            (evidence / "EXPECTED_EXHAUSTION").write_text("No-reclamation control exhausted PMDK; manager/pool cleanup passed.\n")
+            (evidence / "PASS").unlink()
+            print("PASS: no-reclamation control exhausted the PMDK pool and cleaned up")
+        elif args.client_check:
             (evidence / "PASS").write_text("Network client correctness, metadata, allocation, placement, and lifecycle passed.\n")
             print("PASS: network client correctness, metadata, placement and lifecycle")
         else:

@@ -1,5 +1,5 @@
 # One-worker correctness target with metadata IPC and merge-before-ack writes.
-# Logs are not reclaimed; do not use this for performance measurements.
+# Single-worker synchronous reclamation; not a performance configuration.
 storage: ./
 capacities: # MiB
   memory-cap: 16
@@ -49,3 +49,5 @@ numa:
   memory-node: 1
   pool-directory: /dev/shm
   log-block-bytes: 4096
+  reclaim-logs: true
+  log-block-limit: 0 # 0 means limited only by pool capacity

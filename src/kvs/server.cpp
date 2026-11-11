@@ -1573,7 +1573,9 @@ int main(int argc, char *argv[])
     numa_pool_path = numa_pool_directory + "/pool";
     numa_memory_node = numa["memory-node"].as<int>();
     dinomo_numa::start(numa_pool_path, kStorageNodeCapacity,
-                      numa["host-cpu"].as<int>(), numa_memory_node);
+                      numa["host-cpu"].as<int>(), numa_memory_node,
+                      numa["reclaim-logs"] ? numa["reclaim-logs"].as<bool>() : true,
+                      numa["log-block-limit"] ? numa["log-block-limit"].as<uint64_t>() : 0);
     if (numa_stop_requested) return 0;
 #else
     ib_init(total_available_memory_nodes, num_initial_memory_nodes, 

@@ -1787,6 +1787,10 @@ uint64_t Dinomo<T>::cache_miss_cost()
 template <typename T>
 void Dinomo<T>::merge(bool clear_cache)
 {
+#ifdef DINOMO_NUMA_MILESTONE
+    if (dinomo_numa::reclamation_enabled() && (!clear_cache || batching))
+        throw std::runtime_error("NUMA reclamation requires an unbatched merge with cache retirement");
+#endif
 #ifdef SEKWON_DEBUG
     printf("%s\n", __func__);
 #endif
@@ -1906,6 +1910,18 @@ void Dinomo<T>::merge(bool clear_cache)
         indirect_pointer_cache.clear();
     }
 
+#ifdef DINOMO_NUMA_MILESTONE
+    if (dinomo_numa::reclamation_enabled()) {
+        // Drop unused allocation grants as well as the active/local log copies
+        // retired above. Nothing in compute may retain a recyclable address.
+        memset(log_blocks_raddrs, 0, sizeof(uint64_t) * MAX_PREALLOC_NUM);
+        uint64_t empty_head = 0;
+        post_write_signaled_blocking_profile(sizeof(empty_head), lkey_buf, 0, qp,
+                reinterpret_cast<char *>(&empty_head), mapping_table_raddr(config_info.rank),
+                ib_res.rkey_pool[thread_id], cq, &rdma_write_counter, &rdma_write_payload);
+        dinomo_numa::release_logs();
+    }
+#endif
     free(wc);
     return ;
 error:

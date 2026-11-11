@@ -43,10 +43,14 @@ state. Evidence:
 - Interrupted runner: `results/server-startup-4f8x20fj/INTERRUPTION_PASS`.
 - Standalone regression: `results/milestone-Og9WU4qF`.
 
-These are bounded one-worker correctness results. Each write retires its log
-and requests a fresh allocation batch; there is no continuous merge or safe
-reclamation. Multiworker synchronization, replication, recovery, persistence,
-benchmark integration, and performance claims remain out of scope.
+Those were pre-reclamation correctness results. On `numa-merge-gc`, the manager
+now tracks index ownership and compute leases, with reuse only after an explicit
+quiescent release. Local and remote memory-only stress tests passed beyond
+16 MiB pool capacity while fresh log allocation remained at 34 blocks. The
+reuse-disabled control exhausted PMDK as expected. See
+[LOG_RECLAMATION.md](LOG_RECLAMATION.md) for the protocol and current evidence.
+Continuous merge, multiworker synchronization, replication, recovery,
+persistence, benchmark integration, and performance claims remain out of scope.
 
 ## Initial audit (historical findings before the implementation above)
 

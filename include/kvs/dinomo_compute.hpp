@@ -126,6 +126,10 @@ public:
     void merge(bool clear_cache);
 
     void flush();
+#ifdef DINOMO_NUMA_SERVER
+    void publish();
+    uint64_t staged_read_count() const { return log_hit_counter; }
+#endif
 
     void failover(int failed_node_rank);
 
@@ -458,13 +462,26 @@ std::pair<bool, void *> Dinomo<T>::check_from_staging_pool(const uint64_t key,
     offset = pool->offset.load();
     if (offset != 0) {
         if (bloom_check(BFilter, &key, key_len) != 0) {
+#ifdef DINOMO_NUMA_MILESTONE
+            oplogs *latest = nullptr;
+#endif
             for (uint64_t j = 0; j < offset;) {
                 oLog_p = (oplogs *)((uint64_t)pool->buffer + j);
+#ifdef DINOMO_NUMA_MILESTONE
+                if (offset - j < sizeof(oplogs) || oLog_p->val_len > offset - j - sizeof(oplogs))
+                    throw std::runtime_error("Invalid staged log record");
+                if (oLog_p->key == key && oLog_p->key_len == key_len && oLog_p->commit == 1)
+                    latest = oLog_p;
+#else
                 if (oLog_p->key == key)
                     return std::make_pair(true, oLog_p);
+#endif
 
                 j += sizeof(oplogs) + oLog_p->val_len;
             }
+#ifdef DINOMO_NUMA_MILESTONE
+            if (latest) return {true, latest};
+#endif
         }
     }
 
@@ -534,13 +551,29 @@ std::pair<bool, void *> Dinomo<T>::get_from_oplogs(const uint64_t key, const siz
         bloomFilter *bIter = (bloomFilter *)(*it);
         snapshot_l = (log_block *) bIter->local_log_block;
         if (bloom_check(bIter, &key, key_len) != 0) {
+#ifdef DINOMO_NUMA_MILESTONE
+            oplogs *latest = nullptr;
+#endif
             while (snapshot_l->offset > offset) {
                 opL = (oplogs *)((uint64_t)snapshot_l->buffer + offset);
+#ifdef DINOMO_NUMA_MILESTONE
+                const auto end = snapshot_l->offset.load();
+                if (end - offset < sizeof(oplogs) || opL->val_len > end - offset - sizeof(oplogs))
+                    throw std::runtime_error("Invalid copied log record");
+                if (opL->key == key && opL->key_len == key_len && opL->commit == 1)
+                    latest = opL;
+#else
                 if (opL->key == key)
                     return std::make_pair(true, opL);
+#endif
 
                 offset = offset + sizeof(oplogs) + opL->val_len;
             }
+#ifdef DINOMO_NUMA_MILESTONE
+            // Copies are newest-block first; select the last matching record
+            // within the first block containing this key.
+            if (latest) return {true, latest};
+#endif
         }
 
         offset = 0;
@@ -1783,6 +1816,23 @@ uint64_t Dinomo<T>::cache_miss_cost()
 {
     return cache->MissCost();
 }
+
+#ifdef DINOMO_NUMA_SERVER
+template <typename T>
+void Dinomo<T>::publish()
+{
+    if (!non_replicated_alloc) return;
+    auto *pool = reinterpret_cast<log_block *>(ib_res.ib_pool +
+        (sizeof(log_block) + MAX_LOG_BLOCK_LEN) * static_cast<uint64_t>(thread_id));
+    // Record writes have completed. Publish the extent before acknowledging;
+    // this does not update the index or release any compute references.
+    post_write_signaled_blocking_profile(LOG_BLOCK_HEADER_LEN - sizeof(uint64_t) - sizeof(uint32_t),
+        ib_res.mr_pool->lkey, 0, ib_res.qp[thread_id],
+        reinterpret_cast<char *>(pool) + sizeof(uint32_t), non_replicated_alloc + sizeof(uint32_t),
+        ib_res.rkey_pool[thread_id], ib_res.cq[thread_id], &rdma_write_counter, &rdma_write_payload);
+    std::atomic_thread_fence(std::memory_order_release);
+}
+#endif
 
 template <typename T>
 void Dinomo<T>::merge(bool clear_cache)

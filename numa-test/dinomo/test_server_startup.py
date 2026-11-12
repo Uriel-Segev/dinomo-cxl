@@ -33,11 +33,21 @@ def main():
     parser.add_argument("--log-block-limit", type=int, default=0)
     parser.add_argument("--no-reclaim", action="store_true")
     parser.add_argument("--expect-exhaustion", action="store_true")
+    parser.add_argument("--merge-writes", type=int, default=16)
+    parser.add_argument("--merge-ms", type=int, default=20)
+    parser.add_argument("--idle-ms", type=int, default=0)
+    parser.add_argument("--require-deferred", action="store_true")
     args = parser.parse_args()
     if args.expect_exhaustion and not (args.client_check and args.no_reclaim and args.gc_rounds and args.log_block_limit == 0):
         parser.error("Expected exhaustion requires a GC workload, --no-reclaim, and no block limit")
     if not 16 <= args.pool_mb <= 4096 or args.log_block_limit < 0 or not 0 <= args.gc_rounds <= 4096:
         parser.error("Invalid pool size, block limit, or GC round count")
+    if args.merge_writes < 0 or args.merge_ms < 0 or not (args.merge_writes or args.merge_ms):
+        parser.error("A merge trigger must be enabled")
+    if args.require_deferred and (args.merge_writes < 16 or args.merge_ms != 0 or args.keys < 4):
+        parser.error("Deterministic deferred checks require >=16 writes, timer disabled, >=4 keys")
+    if args.idle_ms and (args.merge_writes != 0 or args.merge_ms <= 0 or args.idle_ms <= args.merge_ms):
+        parser.error("Idle probe requires timer-only merge and an idle interval longer than the timer")
     root = Path(__file__).resolve().parents[2]
     build = (root / args.build_dir).resolve()
     server_binary = build / "target/kvs/dinomo-kvs-numa"
@@ -63,6 +73,8 @@ def main():
     config = config.replace("storage-cap: 256", f"storage-cap: {args.pool_mb}")
     config = config.replace("log-block-limit: 0", f"log-block-limit: {args.log_block_limit}")
     if args.no_reclaim: config = config.replace("reclaim-logs: true", "reclaim-logs: false")
+    config = config.replace("merge-write-limit: 16", f"merge-write-limit: {args.merge_writes}")
+    config = config.replace("merge-interval-ms: 20", f"merge-interval-ms: {args.merge_ms}")
     # Keep private pool directories under an owned evidence subdirectory, so
     # cleanup can be verified without inspecting another user's resources.
     pool_root = Path(tempfile.mkdtemp(prefix="dinomo-startup-", dir="/dev/shm"))
@@ -126,7 +138,7 @@ def main():
                 client_directory.mkdir()
                 with (evidence / "client.log").open("w") as client_output:
                     client = subprocess.Popen(
-                        ["taskset", "-c", str(args.host_cpu), str(client_binary), str(args.keys), str(args.gc_rounds)],
+                        ["taskset", "-c", str(args.host_cpu), str(client_binary), str(args.keys), str(args.gc_rounds), str(args.idle_ms)],
                         cwd=client_directory, stdout=client_output, stderr=client_output)
                     processes.append(client)
                     deadline = time.monotonic() + 180
@@ -160,6 +172,27 @@ def main():
                 raise RuntimeError("Expected shared-pool, allocation, and metadata operations")
             if args.keys >= 10 and int(counters.group(3)) <= 2:
                 raise RuntimeError("Workload did not exercise repeated allocation batches")
+            merge = re.search(r"NUMA merge: published_writes=(\d+) threshold_merges=(\d+) timer_merges=(\d+) shutdown_merges=(\d+) staging_gets=(\d+) index_gets=(\d+) pending_writes=(\d+)", server_text)
+            if not merge:
+                raise RuntimeError("Missing merge/visibility evidence")
+            writes, thresholds, timers, shutdowns, staged, indexed, pending = map(int, merge.groups())
+            if pending or not writes:
+                raise RuntimeError("Pending writes or missing publication evidence")
+            if (args.require_deferred or args.idle_ms or args.gc_rounds) and not indexed:
+                raise RuntimeError("Missing index-read evidence")
+            if args.require_deferred and (not staged or not thresholds or timers or thresholds >= writes or (writes % args.merge_writes and not shutdowns)):
+                raise RuntimeError("Deferred reads/threshold/shutdown merge checks failed")
+            if args.merge_writes == 1 and args.merge_ms == 0 and (thresholds != writes or timers or shutdowns or staged):
+                raise RuntimeError("Merge-before-ack control did not merge each write")
+            if args.idle_ms and not timers:
+                raise RuntimeError("Idle timer did not merge pending writes")
+            if args.idle_ms:
+                client_text = (evidence / "client.log").read_text()
+                begin = re.search(r"IDLE_BEGIN: monotonic_ns=(\d+)", client_text)
+                end = re.search(r"IDLE_END: monotonic_ns=(\d+)", client_text)
+                events = re.findall(r"NUMA merge request: monotonic_ns=(\d+)", server_text)
+                if not begin or not end or not any(int(begin.group(1)) < int(event) < int(end.group(1)) for event in events):
+                    raise RuntimeError("No merge started while the client was idle")
             if args.gc_rounds:
                 gc = re.search(r"NUMA GC: enabled=1 fresh_blocks=(\d+) reused_blocks=(\d+) reclaimed_blocks=(\d+) live_blocks=(\d+) free_blocks=(\d+) leased_blocks=(\d+) live_records=(\d+) logical_log_bytes=(\d+)", server_text)
                 if not gc:

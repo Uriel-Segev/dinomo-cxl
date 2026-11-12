@@ -57,9 +57,10 @@ int main(int argc, char **argv)
 {
     try {
         const unsigned keys = argc >= 2 ? std::stoul(argv[1]) : 256;
-        const unsigned rounds = argc == 3 ? std::stoul(argv[2]) : 0;
-        if (argc > 3 || keys < 1 || keys > 2000 || rounds > 4096 || (rounds && keys % 2))
-            throw std::runtime_error("Usage: dinomo-numa-client-check [NUM_KEYS:1..2000] [GC_ROUNDS:0..4096; even keys]");
+        const unsigned rounds = argc >= 3 ? std::stoul(argv[2]) : 0;
+        const unsigned idle_ms = argc == 4 ? std::stoul(argv[3]) : 0;
+        if (argc > 4 || keys < 1 || keys > 2000 || rounds > 4096 || (rounds && keys % 2) || idle_ms > 10000)
+            throw std::runtime_error("Usage: dinomo-numa-client-check [NUM_KEYS] [GC_ROUNDS] [IDLE_MS]");
         auto key_name = [rounds](unsigned key) {
             // Collide in the initial CLHT table when stressing reclamation.
             return std::to_string(rounds ? 1 + 1024UL * (key - 1) : key);
@@ -76,6 +77,24 @@ int main(int argc, char **argv)
         const std::string binary_meta("metadata\0with-bytes", 19);
         write(client, meta, binary_meta, timestamp++, true);
         read(client, meta, binary_meta);
+
+        if (keys >= 4) {
+            // Eight writes: with threshold >=16 and timer disabled, every read
+            // here must precede the first merge. Force rollover twice to test
+            // newest-record lookup within both active and retained log copies.
+            write(client, key_name(1), "first", timestamp++, false);
+            write(client, key_name(1), "second", timestamp++, true);
+            write(client, key_name(1), "third", timestamp++, true);
+            read(client, key_name(1), "third");
+            write(client, key_name(2), std::string(3000, 'x'), timestamp++, false);
+            write(client, key_name(3), std::string(3000, 'y'), timestamp++, false);
+            read(client, key_name(1), "third");
+            write(client, key_name(1), "fourth", timestamp++, true);
+            write(client, key_name(1), "fifth", timestamp++, true);
+            read(client, key_name(1), "fifth");
+            write(client, key_name(4), std::string(3000, 'z'), timestamp++, false);
+            read(client, key_name(1), "fifth");
+        }
 
         // Every acknowledgement is followed by a GET through the existing
         // client API; the harness never sends merge or clears worker staging.
@@ -118,6 +137,18 @@ int main(int argc, char **argv)
         }
         read(client, "99999999", "", true);
         read(client, meta, binary_meta);
+        if (idle_ms) {
+            // Drain earlier timer cycles before starting a fresh idle probe.
+            std::this_thread::sleep_for(std::chrono::milliseconds(idle_ms));
+            write(client, key_name(1), "timer-final", timestamp++, true);
+            std::cout << "IDLE_BEGIN: monotonic_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(idle_ms));
+            std::cout << "IDLE_END: monotonic_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() << std::endl;
+            read(client, key_name(1), "timer-final");
+            std::cout << "IDLE_PROBE: wait_ms=" << idle_ms << '\n';
+        }
         std::cout << "PASS: existing KvsClient; " << keys
                   << " inserts, repeated updates, immediate and later reads, variable/binary values, missing keys, metadata GET/PUT/UPDATE\n";
         return 0;

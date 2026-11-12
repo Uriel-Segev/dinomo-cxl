@@ -18,6 +18,7 @@ std::string numa_config_path = "conf/dinomo-numa.yml";
 std::string numa_pool_path;
 std::string numa_pool_directory;
 int numa_memory_node = 1;
+uint64_t numa_merge_writes = 16, numa_merge_ms = 20;
 }
 #endif
 
@@ -682,7 +683,8 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
 
     // enter event loop
 #ifdef DINOMO_NUMA_SERVER
-    std::cout << "NUMA server ready: one worker; synchronous merge-before-ack writes" << std::endl;
+    kvs_->configure_merge(numa_merge_writes, numa_merge_ms);
+    std::cout << "NUMA server ready: one worker; published writes with deferred merge" << std::endl;
 #endif
     while (
 #ifdef DINOMO_NUMA_SERVER
@@ -693,6 +695,7 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
     )
     {
 #ifdef DINOMO_NUMA_SERVER
+        kvs_->maybe_merge();
         try {
             kZmqUtil->poll(0, &pollitems);
         } catch (const zmq::error_t &error) {
@@ -1370,6 +1373,9 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
         //}
 #endif
     }
+#ifdef DINOMO_NUMA_SERVER
+    kvs_->finish_writes();
+#endif
 }
 
 #ifdef DINOMO_NUMA_SERVER
@@ -1564,6 +1570,10 @@ int main(int argc, char *argv[])
         MAX_LOG_BLOCK_LEN + LOG_BLOCK_HEADER_LEN > 64 * 1024)
         throw std::runtime_error("NUMA server requires 1..64 preallocated blocks and log blocks <= 64 KiB");
     auto numa = conf["numa"];
+    numa_merge_writes = numa["merge-write-limit"] ? numa["merge-write-limit"].as<uint64_t>() : 16;
+    numa_merge_ms = numa["merge-interval-ms"] ? numa["merge-interval-ms"].as<uint64_t>() : 20;
+    if (!numa_merge_writes && !numa_merge_ms)
+        throw std::runtime_error("NUMA merge needs a write limit or a timer");
     std::string pool_template = numa["pool-directory"].as<std::string>() + "/dinomo-server-XXXXXX";
     std::vector<char> pool_directory(pool_template.begin(), pool_template.end());
     pool_directory.push_back('\0');

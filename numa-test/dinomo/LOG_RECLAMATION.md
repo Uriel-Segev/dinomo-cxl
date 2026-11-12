@@ -1,7 +1,11 @@
 # Synchronous single-worker log reclamation
 
-This milestone recycles obsolete log blocks while preserving merge-before-ack
-and the existing DINOMO compute/P-CLHT code. It does not add background merge,
+This milestone recycles obsolete log blocks while preserving synchronous
+single-worker merge/release and the existing DINOMO compute/P-CLHT code.
+The server now also supports acknowledgements before merge; see
+[DEFERRED_MERGE.md](DEFERRED_MERGE.md). Pending records remain leased until a
+complete merge and release, so the ownership rule below is unchanged.
+It does not add background merge,
 multiple workers, compaction, deletion, replication, or crash recovery.
 
 ## Ownership rule
@@ -114,6 +118,10 @@ actual `pmemobj_zalloc` failure with no artificial block cap, then verifies
 manager/pool cleanup. It records `EXPECTED_EXHAUSTION`, not a workload PASS.
 
 ## Validated on c8220
+
+These are the saved merge-before-ack reclamation baseline runs. Current
+deferred-merge tests and counters are documented in DEFERRED_MERGE.md; the
+client now also includes a pre-merge rollover probe.
 
 | Test | Result | Local evidence directory |
 |---|---|---|

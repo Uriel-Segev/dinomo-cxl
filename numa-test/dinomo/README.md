@@ -255,12 +255,11 @@ python3 numa-test/dinomo/test_server_startup.py --host-cpu 2 --memory-node 1
 
 ### Visibility and metadata contract
 
-For this target, each user PUT/UPDATE writes a log record and synchronously
-merges it into the original P-CLHT index before returning to the request
-handler for acknowledgement. The NUMA merge retires local staging and clears
-caches, so a following GET uses the shared index and sees the acknowledged
-value. This avoids relying on the old staging scan's first-match behavior.
-There is no background merge or concurrent worker access.
+The first network milestone used merge-before-ack for every user write. The
+current NUMA server publishes each record before acknowledgement, reads the
+newest value from pending logs when necessary, and merges at a write threshold
+or timer (milestone 4 below). The triggering write may wait for merge; other
+writes need not. There is still no background merge or concurrent worker access.
 
 Metadata GET/PUT use bounded synchronous Unix-domain IPC to a volatile
 string-key store in manager-local memory, like the original storage metadata
@@ -270,9 +269,9 @@ their serialized LWW envelope, must fit one log block after its record header
 (the configuration uses 4 KiB total log blocks). Oversized requests fail
 explicitly. Missing results are handled before LWW deserialization.
 
-Merge-before-ack retires a log for every write. The NUMA server now recycles
-unreferenced logs after an explicit compute release, as described in milestone
-3 below. This remains a synchronous single-worker correctness configuration,
+The NUMA server recycles unreferenced logs only after a complete merge and
+explicit compute release, as described in milestone 3 below. Merge/release
+remains synchronous even though acknowledgements can precede merge. This is
 not a performance configuration. The standalone baseline still tests
 capacity-driven rollover separately and defaults to reclamation disabled.
 
@@ -322,6 +321,30 @@ See [LOG_RECLAMATION.md](LOG_RECLAMATION.md) for ownership rules, exact counters
 commands, the no-reclamation control, and saved evidence. This does not add
 continuous/background merge, multiple workers, partial-block compaction, or
 recovery.
+
+## Milestone 4: deferred merge with correct recent reads
+
+User writes now publish their log extent before acknowledgement. The server
+merges after 16 writes or 20 ms from the first pending write by default.
+Unmerged reads select the newest matching record in active staging or retained
+log copies, including after rollover. Merge remains worker-controlled and
+synchronous; the existing release handshake still protects reclamation.
+Normal shutdown drains outstanding writes.
+
+~~~bash
+cd ~/dinomo-cxl
+MEMORY_NODE=0 ./numa-test/dinomo/run_deferred_test.sh --no-offline
+./numa-test/dinomo/run_deferred_test.sh
+~~~
+
+These deterministic tests disable the timer and use a 16-write threshold. Local
+and remote memory-only runs passed 8,296 writes with 518 threshold merges and
+one shutdown drain. The 16 MiB pool handled about 20 MiB of update values with
+only 36 fresh log objects. Timer-only idle merge and merge-before-ack controls
+also passed. CPUs were restored after remote testing.
+
+See [DEFERRED_MERGE.md](DEFERRED_MERGE.md) for function flow, policy settings,
+test commands, counters, evidence, and the remaining concurrency limitations.
 
 ## Later milestones
 

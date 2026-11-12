@@ -373,6 +373,12 @@ void allocate_logs(uint64_t *addresses, size_t count)
 void merge_logs()
 {
     std::atomic_thread_fence(std::memory_order_seq_cst);
+#ifdef DINOMO_NUMA_SERVER
+    timespec instant{};
+    require(clock_gettime(CLOCK_MONOTONIC, &instant) == 0, "Read merge clock");
+    fprintf(stdout, "NUMA merge request: monotonic_ns=%lld\n",
+            static_cast<long long>(instant.tv_sec) * 1000000000LL + instant.tv_nsec);
+#endif
     Message message;
     message.command = Merge;
     (void)request(message);

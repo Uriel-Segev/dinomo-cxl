@@ -23,9 +23,12 @@ The NUMA compute methods bypass SEND and CQ polling for these commands.
 Bounds checks limit the combined metadata key/value payload to 64 KiB.
 Ordinary user records and the index remain in the selected shared pool.
 
-`DinomoKVStore` merges each NUMA server PUT/UPDATE before returning for
-acknowledgement, retiring staging and clearing caches through the existing
-NUMA merge path. Missing results are checked before LWW deserialization.
+The first integrated `DinomoKVStore` merged each write before acknowledgement.
+The current server publishes each write, reads newest pending values, and
+merges at a worker-controlled threshold or timer. Complete merge and compute
+release still precede log reuse; normal shutdown drains pending writes.
+See [DEFERRED_MERGE.md](DEFERRED_MERGE.md) for the validated current contract.
+Missing results are checked before LWW deserialization.
 The NUMA serializer stores exact binary LWW payloads without adding NUL
 terminators. Empty-cache inserts release their copied values in this target.
 

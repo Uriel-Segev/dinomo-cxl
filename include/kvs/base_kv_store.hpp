@@ -3,6 +3,9 @@
 
 #include "anna.pb.h"
 #include "lattices/core_lattices.hpp"
+#ifdef DINOMO_NUMA_SERVER
+#include <chrono>
+#endif
 
 #ifdef ENABLE_DINOMO_KVS // Sekwon
 #ifndef ENABLE_CLOVER_KVS
@@ -49,6 +52,25 @@ template <typename T>
 class DinomoKVStore {
     protected:
         Dinomo<T> db;
+#ifdef DINOMO_NUMA_SERVER
+        uint64_t pending_writes = 0, published_writes = 0;
+        uint64_t merge_write_limit = 16, merge_interval_ms = 20;
+        uint64_t threshold_merges = 0, timer_merges = 0, shutdown_merges = 0;
+        uint64_t staging_gets = 0, index_gets = 0;
+        std::chrono::steady_clock::time_point pending_since;
+        void merge_pending(uint64_t &counter) {
+            db.merge(true);
+            pending_writes = 0;
+            ++counter;
+        }
+        void publish_write() {
+            db.publish();
+            if (pending_writes == 0) pending_since = std::chrono::steady_clock::now();
+            ++pending_writes;
+            ++published_writes;
+            maybe_merge();
+        }
+#endif
 
     public:
         DinomoKVStore() {}
@@ -59,7 +81,16 @@ class DinomoKVStore {
 
         std::pair<char *, size_t> get(const uint64_t k, const size_t key_len, AnnaError &error)
         {
+#ifdef DINOMO_NUMA_SERVER
+            auto before = db.staged_read_count();
+#endif
             auto val = db.get(k, key_len);
+#ifdef DINOMO_NUMA_SERVER
+            if (val.second) {
+                if (db.staged_read_count() != before) ++staging_gets;
+                else ++index_gets;
+            }
+#endif
             if (val.second == 0) {
                 error = AnnaError::KEY_DNE;
             }
@@ -73,7 +104,7 @@ class DinomoKVStore {
             if (val_len > MAX_LOG_BLOCK_LEN - sizeof(oplogs))
                 throw std::runtime_error("NUMA value exceeds log record capacity");
             unsigned result = db.put(k, key_len, v, val_len, false);
-            db.merge(true);
+            publish_write();
             return result;
 #else
             return db.put(k, key_len, v, val_len, false);
@@ -86,7 +117,7 @@ class DinomoKVStore {
             if (val_len > MAX_LOG_BLOCK_LEN - sizeof(oplogs))
                 throw std::runtime_error("NUMA value exceeds log record capacity");
             unsigned result = db.put(k, key_len, v, val_len, true);
-            db.merge(true);
+            publish_write();
             return result;
 #else
             return db.put(k, key_len, v, val_len, true);
@@ -133,7 +164,35 @@ class DinomoKVStore {
             return db.putReplicated(k, key_len, v, val_len, true);
         }
 
-        void merge(bool clear_cache) { db.merge(clear_cache); }
+        void merge(bool clear_cache) {
+            db.merge(clear_cache);
+#ifdef DINOMO_NUMA_SERVER
+            pending_writes = 0;
+#endif
+        }
+
+#ifdef DINOMO_NUMA_SERVER
+        void configure_merge(uint64_t writes, uint64_t milliseconds) {
+            if (!writes && !milliseconds)
+                throw std::runtime_error("NUMA merge needs a write limit or a timer");
+            merge_write_limit = writes;
+            merge_interval_ms = milliseconds;
+        }
+        void maybe_merge() {
+            if (!pending_writes) return;
+            if (merge_write_limit && pending_writes >= merge_write_limit)
+                merge_pending(threshold_merges);
+            else if (merge_interval_ms && std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - pending_since).count() >= merge_interval_ms)
+                merge_pending(timer_merges);
+        }
+        void finish_writes() {
+            if (pending_writes) merge_pending(shutdown_merges);
+            fprintf(stdout, "NUMA merge: published_writes=%lu threshold_merges=%lu timer_merges=%lu shutdown_merges=%lu staging_gets=%lu index_gets=%lu pending_writes=%lu\n",
+                published_writes, threshold_merges, timer_merges, shutdown_merges,
+                staging_gets, index_gets, pending_writes);
+        }
+#endif
 
         void flush() { db.flush(); }
 

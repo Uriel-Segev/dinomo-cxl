@@ -1,4 +1,4 @@
-# One-worker correctness target with metadata IPC and merge-before-ack writes.
+# One-worker correctness target with metadata IPC and deferred merge.
 # Single-worker synchronous reclamation; not a performance configuration.
 storage: ./
 capacities: # MiB
@@ -51,3 +51,5 @@ numa:
   log-block-bytes: 4096
   reclaim-logs: true
   log-block-limit: 0 # 0 means limited only by pool capacity
+  merge-write-limit: 16 # 1 restores merge-before-ack; 0 disables this trigger
+  merge-interval-ms: 20 # measured from the first pending write; 0 disables timer

@@ -25,6 +25,8 @@ def wait_for(process, log, marker, seconds=30):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", default="build/numa")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--worker-cpus", help="Comma-separated CPU for each compute worker")
     parser.add_argument("--host-cpu", type=int, default=2)
     parser.add_argument("--memory-node", type=int, default=0)
     parser.add_argument("--client-check", action="store_true", help="Run existing-client network correctness checks")
@@ -47,6 +49,13 @@ def main():
     parser.add_argument("--require-overlap", action="store_true")
     parser.add_argument("--require-backpressure", action="store_true")
     args = parser.parse_args()
+    worker_cpus = [int(cpu) for cpu in args.worker_cpus.split(",")] if args.worker_cpus else [args.host_cpu] * args.workers
+    if not 1 <= args.workers <= 64 or len(worker_cpus) != args.workers:
+        parser.error("Use 1..64 workers and one CPU per worker")
+    if args.workers > 1 and not args.concurrent:
+        parser.error("Multiple workers require --concurrent")
+    if args.workers > 1 and (args.require_deferred or args.idle_ms or args.expect_exhaustion):
+        parser.error("These deterministic single-worker probes require --workers 1")
     if args.expect_exhaustion and not (args.client_check and args.no_reclaim and args.gc_rounds and args.log_block_limit == 0):
         parser.error("Expected exhaustion requires a GC workload, --no-reclaim, and no block limit")
     if not 16 <= args.pool_mb <= 4096 or args.log_block_limit < 0 or not 0 <= args.gc_rounds <= 4096:
@@ -88,6 +97,8 @@ def main():
     (evidence / "topology.txt").write_text(subprocess.check_output(
         ["bash", str(root / "numa-test/numa_cpu_control.sh"), "status"], text=True))
     config = (root / "conf/dinomo-numa.yml").read_text()
+    config = config.replace("  memory: 1", f"  memory: {args.workers}", 1)
+    config += "\n  worker-cpus: [" + ", ".join(map(str, worker_cpus)) + "]\n"
     config = config.replace("host-cpu: 2", f"host-cpu: {args.host_cpu}")
     config = config.replace("memory-node: 1", f"memory-node: {args.memory_node}")
     config = config.replace("storage-cap: 256", f"storage-cap: {args.pool_mb}")
@@ -123,7 +134,7 @@ def main():
                          for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         invalid_config = evidence / "invalid.yml"
-        invalid_config.write_text(config.replace("memory: 1", "memory: 2", 1))
+        invalid_config.write_text(config.replace(f"  memory: {args.workers}", "  memory: 0", 1))
         with (evidence / "invalid-config.log").open("w") as output:
             invalid = subprocess.run([str(server_binary), str(invalid_config)],
                                      cwd=evidence, stdout=output, stderr=output, timeout=10)
@@ -152,7 +163,8 @@ def main():
             server = subprocess.Popen([str(server_binary), str(config_path)],
                                       cwd=evidence, stdout=server_output, stderr=server_output)
             processes.append(server)
-            wait_for(server, evidence / "server.log", "NUMA server ready:")
+            for worker in range(args.workers):
+                wait_for(server, evidence / "server.log", f"NUMA server ready: worker={worker};")
             if route.poll() is not None:
                 raise RuntimeError("Routing process failed")
             children = Path(f"/proc/{server.pid}/task/{server.pid}/children").read_text().split()
@@ -160,32 +172,51 @@ def main():
                 raise RuntimeError(f"Expected one manager child, found {children}")
             server_affinity = sorted(os.sched_getaffinity(server.pid))
             manager_affinity = sorted(os.sched_getaffinity(int(children[0])))
-            if server_affinity != [args.host_cpu] or manager_affinity != [manager_cpu]:
+            if server_affinity != [worker_cpus[0]] or manager_affinity != [manager_cpu]:
                 raise RuntimeError("Unexpected server/manager CPU affinity")
+            placements = re.findall(r"NUMA worker placement: worker=(\d+) tid=(\d+) cpu=(\d+)",
+                                    (evidence / "server.log").read_text())
+            worker_threads = {}
+            for worker, tid, cpu in placements:
+                worker = int(worker)
+                affinity = sorted(os.sched_getaffinity(int(tid)))
+                if int(cpu) != worker_cpus[worker] or affinity != [worker_cpus[worker]]:
+                    raise RuntimeError("Unexpected compute worker affinity")
+                worker_threads[worker] = {"tid": int(tid), "cpus": affinity}
+            if len(worker_threads) != args.workers:
+                raise RuntimeError("Missing worker CPU placement evidence")
             (evidence / "processes.json").write_text(json.dumps({
                 "server": server.pid, "manager": int(children[0]), "router": route.pid,
-                "server_cpus": server_affinity, "manager_cpus": manager_affinity}, indent=2))
+                "server_cpus": server_affinity, "manager_cpus": manager_affinity,
+                "workers": worker_threads}, indent=2))
             if args.client_check:
-                client_directory = evidence / "client"
-                client_directory.mkdir()
-                with (evidence / "client.log").open("w") as client_output:
-                    client = subprocess.Popen(
-                        ["taskset", "-c", str(args.host_cpu), str(client_binary), str(args.keys), str(args.gc_rounds), str(args.idle_ms)],
-                        cwd=client_directory, stdout=client_output, stderr=client_output)
+                clients = []
+                for client_id in range(args.workers):
+                    client_directory = evidence / f"client-{client_id}"
+                    client_directory.mkdir()
+                    log_path = evidence / ("client.log" if client_id == 0 else f"client-{client_id}.log")
+                    with log_path.open("w") as client_output:
+                        client = subprocess.Popen(
+                            ["taskset", "-c", str(args.host_cpu), str(client_binary), str(args.keys),
+                             str(args.gc_rounds), str(args.idle_ms), str(args.workers), str(client_id)],
+                            cwd=client_directory, stdout=client_output, stderr=client_output)
                     processes.append(client)
-                    deadline = time.monotonic() + 180
-                    while client.poll() is None and time.monotonic() < deadline:
-                        if server.poll() is not None:
-                            if not args.expect_exhaustion:
-                                raise RuntimeError("Server exited during workload: " + (evidence / "server.log").read_text()[-4000:])
-                            client.terminate()
+                    clients.append((client, log_path))
+                deadline = time.monotonic() + 180
+                while any(client.poll() is None for client, _ in clients) and time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        if not args.expect_exhaustion:
+                            raise RuntimeError("Server exited during workload: " + (evidence / "server.log").read_text()[-4000:])
+                        for client, _ in clients:
+                            if client.poll() is None: client.terminate()
                             client.wait(timeout=15)
-                            break
-                        time.sleep(0.05)
+                        break
+                    time.sleep(0.05)
+                for client, log_path in clients:
                     if client.poll() is None:
                         raise RuntimeError("Client exceeded workload deadline")
                     if client.returncode != 0 and not args.expect_exhaustion:
-                        raise RuntimeError("Client correctness failed: " + (evidence / "client.log").read_text())
+                        raise RuntimeError("Client correctness failed: " + log_path.read_text())
             if args.expect_exhaustion:
                 if client.returncode == 0 or server.wait(timeout=15) == 0 or "Allocate PMDK log block" not in (evidence / "server.log").read_text():
                     raise RuntimeError("No-reclamation control did not exhaust the PMDK pool as expected")
@@ -204,10 +235,13 @@ def main():
                 raise RuntimeError("Expected shared-pool, allocation, and metadata operations")
             if args.keys >= 10 and int(counters.group(3)) <= 2:
                 raise RuntimeError("Workload did not exercise repeated allocation batches")
-            merge = re.search(r"NUMA merge: published_writes=(\d+) threshold_merges=(\d+) timer_merges=(\d+) shutdown_merges=(\d+) staging_gets=(\d+) index_gets=(\d+) pending_writes=(\d+)", server_text)
-            if not merge:
+            merge_matches = re.findall(r"NUMA merge: published_writes=(\d+) threshold_merges=(\d+) timer_merges=(\d+) shutdown_merges=(\d+) staging_gets=(\d+) index_gets=(\d+) pending_writes=(\d+) worker=(\d+)", server_text)
+            if len(merge_matches) != args.workers or {int(row[7]) for row in merge_matches} != set(range(args.workers)):
                 raise RuntimeError("Missing merge/visibility evidence")
-            writes, thresholds, timers, shutdowns, staged, indexed, pending = map(int, merge.groups())
+            writes, thresholds, timers, shutdowns, staged, indexed, pending = (
+                sum(int(row[column]) for row in merge_matches) for column in range(7))
+            if args.workers > 1 and any(int(row[0]) == 0 or int(row[6]) != 0 for row in merge_matches):
+                raise RuntimeError("Every compute worker must publish writes and drain")
             if pending or not writes:
                 raise RuntimeError("Pending writes or missing publication evidence")
             if (args.require_deferred or args.idle_ms or args.gc_rounds) and not indexed:
@@ -243,12 +277,17 @@ def main():
                 if not gc:
                     raise RuntimeError("Missing reclamation evidence")
                 fresh, reused, reclaimed, live, free, leased, records, logical_bytes = map(int, gc.groups())
-                if not reused or not reclaimed or leased or records != args.keys or fresh != live + free:
+                if not reused or not reclaimed or leased or records != args.keys * args.workers or fresh != live + free:
                     raise RuntimeError("Reclamation ownership/count checks failed")
                 if args.log_block_limit and fresh > args.log_block_limit:
                     raise RuntimeError("Physical log count exceeded the configured bound")
-                workload = re.search(r"GC_WORKLOAD: update_bytes=(\d+)", (evidence / "client.log").read_text())
-                if logical_bytes <= args.pool_mb * 1024 * 1024 or not workload or int(workload.group(1)) <= args.pool_mb * 1024 * 1024:
+                update_bytes = 0
+                for _, log_path in clients:
+                    workload = re.search(r"GC_WORKLOAD: update_bytes=(\d+)", log_path.read_text())
+                    if not workload:
+                        raise RuntimeError(f"Missing workload byte count: {log_path}")
+                    update_bytes += int(workload.group(1))
+                if logical_bytes <= args.pool_mb * 1024 * 1024 or update_bytes <= args.pool_mb * 1024 * 1024:
                     raise RuntimeError("Workload did not exceed pool capacity")
             if args.require_offline and Path(
                     f"/sys/devices/system/node/node{args.memory_node}/cpulist").read_text().strip():

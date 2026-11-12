@@ -53,6 +53,7 @@ class DinomoKVStore {
     protected:
         Dinomo<T> db;
 #ifdef DINOMO_NUMA_SERVER
+        unsigned worker_id_ = 0;
         uint64_t pending_writes = 0, published_writes = 0;
         uint64_t merge_write_limit = 16, merge_interval_ms = 20;
         uint64_t threshold_merges = 0, timer_merges = 0, shutdown_merges = 0;
@@ -84,7 +85,11 @@ class DinomoKVStore {
     public:
         DinomoKVStore() {}
 
-        DinomoKVStore(uint64_t cache_size, uint16_t tid, bool enable_batch, double weight_or_value_ratio) : db(cache_size, tid, enable_batch, weight_or_value_ratio) {}
+        DinomoKVStore(uint64_t cache_size, uint16_t tid, bool enable_batch, double weight_or_value_ratio) : db(cache_size, tid, enable_batch, weight_or_value_ratio) {
+#ifdef DINOMO_NUMA_SERVER
+            worker_id_ = tid;
+#endif
+        }
 
         DinomoKVStore(Dinomo<T> &other) { db = other; }
 
@@ -219,9 +224,9 @@ class DinomoKVStore {
                 // Even a fully merged epoch can leave unused next-epoch credits.
                 db.merge(true);
             }
-            fprintf(stdout, "NUMA merge: published_writes=%lu threshold_merges=%lu timer_merges=%lu shutdown_merges=%lu staging_gets=%lu index_gets=%lu pending_writes=%lu\n",
+            fprintf(stdout, "NUMA merge: published_writes=%lu threshold_merges=%lu timer_merges=%lu shutdown_merges=%lu staging_gets=%lu index_gets=%lu pending_writes=%lu worker=%u\n",
                 published_writes, threshold_merges, timer_merges, shutdown_merges,
-                staging_gets, index_gets, pending_writes);
+                staging_gets, index_gets, pending_writes, worker_id_);
         }
 #endif
 

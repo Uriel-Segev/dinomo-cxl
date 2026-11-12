@@ -1,3 +1,15 @@
+## Resume the NUMA-backed DINOMO work
+
+The current NUMA development branch is `numa-merge-gc`. Start with the
+[NUMA resume guide](numa-test/dinomo/README.md#resume-on-a-new-cloudlab-node-or-in-a-new-chat),
+then read [MULTIWORKER.md](numa-test/dinomo/MULTIWORKER.md) for the current
+ownership protocol, configuration, test commands, results, and limitations.
+Two-worker local/remote NUMA and four-worker local NUMA correctness tests have
+passed. Performance/scaling has not been measured. The next development task
+is adapting the existing LOAD/READ/UPDATE benchmark workflow to this host-native
+NUMA deployment. The Soft-RoCE instructions below describe the separate older
+five-VM deployment.
+
 ## Changes from Original (This Fork)
 
 This fork ports DINOMO to run on a single CloudLab host using 5 KVM virtual machines connected over Soft-RoCE (software RDMA over a virtual Linux bridge), removing the Kubernetes/Docker requirement entirely.

@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-// Experimental one-worker backend. Pool references remain storage-process
+// Experimental fixed-owner worker backend. Pool references remain storage-process
 // addresses for compatibility; every transfer translates them to checked
 // offsets in the compute process shared mapping.
 namespace dinomo_numa {
@@ -23,7 +23,9 @@ struct ConcurrentOptions {
 };
 void start(const std::string &path, std::size_t bytes, int cpu, int memory_node,
            bool reclaim_logs = false, std::size_t block_limit = 0,
-           const ConcurrentOptions &concurrent = {});
+           const ConcurrentOptions &concurrent = {}, std::size_t workers = 1);
+// Bind each compute thread before using its buffers, grants, or manager channel.
+void bind_worker(std::size_t id);
 bool concurrent_enabled();
 std::vector<uint64_t> seal_grants();
 void begin_merge(const std::vector<uint64_t> &addresses);

@@ -1,4 +1,121 @@
-# DINOMO NUMA milestone: one compute worker and a memory-only pool
+# DINOMO NUMA-backed deployment and milestones
+
+## Resume on a new CloudLab node or in a new chat
+
+This is the starting point for branch `numa-merge-gc`. The implementation uses
+DINOMO routing, KVS workers, operation logs, and P-CLHT, with a NUMA-specific
+manager and shared-memory backend replacing the RDMA storage path. Multiple
+compute workers are threads in one KVS process, sharing one pool and manager.
+Two-worker local/remote pool and four-worker local pool tests passed, including
+small-pool reuse; multiworker contention and failure cleanup also passed.
+
+Read [MULTIWORKER.md](MULTIWORKER.md) for current restrictions and recorded
+results. [NETWORK_INTEGRATION_AUDIT.md](NETWORK_INTEGRATION_AUDIT.md) includes
+historical findings; its initial audit is not an outstanding implementation
+checklist. [CONCURRENT_MERGE.md](CONCURRENT_MERGE.md) explains the original
+single-worker merge/reader protection protocol.
+
+### Fresh-node setup
+
+1. Commit and push the work before leaving the old node, then clone your fork
+   and check out `numa-merge-gc` on the new node. Use the saved commit ID to
+   identify the exact baseline; local uncommitted files do not transfer.
+2. Use an x86-64 Linux host with two memory-bearing NUMA nodes for the remote
+   comparison. Inspect topology before choosing CPUs or memory nodes:
+
+   ```bash
+   lscpu -e=CPU,NODE,ONLINE
+   numactl --hardware
+   bash numa-test/numa_cpu_control.sh status
+   df -h /dev/shm
+   ```
+
+   Earlier runs used a c8220 with compute CPUs 2,6,8,10 and manager CPU 4 on
+   node 0. These IDs are examples, not portable defaults. Pick online compute
+   and manager CPUs on the same node; put the pool on that node for the local
+   control and another memory-bearing node for the remote test. Leave CPUs
+   online initially. A single-node host can run the local control only.
+3. Install the build dependencies on Ubuntu:
+
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y build-essential cmake git python3 pkg-config \
+     autoconf automake libtool wget unzip protobuf-compiler libprotobuf-dev \
+     libibverbs-dev librdmacm-dev libtbb-dev libjemalloc-dev libzmq3-dev \
+     libboost-all-dev libyaml-cpp-dev libspdlog-dev libpmemobj-dev libpmem-dev \
+     libnuma-dev libmemcached-dev libpapi-dev libssl-dev numactl pciutils
+   ```
+
+   The NUMA server requires C++17. Verbs development libraries are build
+   dependencies; this deployment does not need a Soft-RoCE device or VMs.
+   CMake downloads pinned dependencies, so first configuration needs network
+   access. Rebuild on the new host rather than copying binaries or CMake caches.
+4. From the repository root, build:
+
+   ```bash
+   make -C src/kvs/libbloom -j4
+   cmake -S . -B build/numa -DCMAKE_BUILD_TYPE=Release -DBUILD_NUMA_SERVER=ON
+   cmake --build build/numa --target dinomo-kvs-numa dinomo-numa-client-check dinomo-route -j4
+   ```
+
+### Re-establish correctness before benchmarking
+
+Run the following from the repository root, replacing **every CPU/node ID** as
+needed for the new host. The runner starts its own router, server, manager,
+and clients, creates a private pool, and saves generated configuration/logs.
+It requires the loopback DINOMO service ports to be free.
+
+```bash
+# Single-worker baseline, local pool, CPUs stay online.
+python3 numa-test/dinomo/test_server_startup.py \
+  --host-cpu 2 --memory-node 0 --client-check --keys 64 \
+  --merge-writes 16 --merge-ms 0 --require-deferred
+
+# Two-worker small-pool stress, no injected delays.
+python3 numa-test/dinomo/test_server_startup.py \
+  --workers 2 --worker-cpus 2,6 --host-cpu 2 --manager-cpu 4 \
+  --memory-node 0 --concurrent --client-check --keys 32 --gc-rounds 256 \
+  --pool-mb 16 --log-block-limit 96 --merge-ms 0
+```
+
+Repeat the second command with `--memory-node 1` for the remote pool. For a
+four-worker local run, use `--workers 4 --worker-cpus 2,6,8,10`,
+`--gc-rounds 128`, and `--log-block-limit 192`. Multiworker mode requires
+concurrent merge and fixed key ownership; caches, batching, and replication
+remain disabled. `conf/dinomo-numa.yml` intentionally defaults to one worker.
+The runner generates per-run overrides without editing that baseline file.
+The examples use stress-sized logs and pools, not benchmark sizing.
+
+Normal runs must pass client value checks, drain all epochs/pending writes,
+and leave zero leased blocks. The runner verifies pool placement, per-worker
+CPU affinity, process exit, and pool cleanup. See MULTIWORKER.md for contention
+and owned-process failure tests. Remote tests above keep pool-node CPUs online;
+CPU-offline memory-only validation is a separate workflow described below.
+
+### Preserve the handoff and next task
+
+Evidence under `numa-test/dinomo/results/` is machine-local and ignored by Git.
+Copy the relevant evidence directories off an expiring node separately; a
+commit/push preserves source and documentation, not those logs. Each run saves
+the commit ID, Git status, generated config, topology, process/affinity data,
+and logs. Copy benchmark results separately as well once they exist. Pools
+are volatile and removed by the tests, so load data again for each fresh run.
+
+The **next development task is benchmark integration**: adapt the existing
+LOAD → READ/UPDATE workflow to launch this host-native deployment. The older
+`vm-configs/c6525-25g/` launchers and `numa-test/run_dinomo_test.sh` still use
+the five-VM Soft-RoCE setup. Measure 1/2/4 workers with matched local/remote
+pool settings, sufficient client concurrency, and all delay hooks disabled.
+Report throughput, median/p99 latency, and index-lock/allocation/merge stalls.
+No performance improvement is established by the correctness stress results.
+Dynamic reassignment, replication, recovery, durability, and actual CXL
+hardware evaluation remain separate work.
+
+For a new chat, ask the agent to read this resume section and MULTIWORKER.md,
+inspect `git status`, and continue with benchmark integration. The sections
+below preserve the earlier single-worker milestones and their test procedures.
+
+## Original standalone single-worker milestone
 
 Run from this directory:
 
@@ -372,12 +489,18 @@ There is still one compute worker; shared-index reads and control/allocation
 requests can wait for the manager. See [CONCURRENT_MERGE.md](CONCURRENT_MERGE.md)
 for the protocol, configuration, commands, evidence, and limitations.
 
+## Fixed-owner multiworker extension
+
+An opt-in extension now supports multiple compute workers with private staging,
+control connections, and epochs against one pool and one manager. Two-worker
+local/remote pool stress and four-worker local pool stress have passed. See
+[MULTIWORKER.md](MULTIWORKER.md) for the ownership contract, run commands,
+validation evidence, and restrictions. The default remains one worker.
+
 ## Later milestones
 
-1. Add multiple workers with per-worker staging and IPC ownership. Define CPU
-   atomic access, publication ordering, allocator ownership, and reclamation
-   rules before allowing concurrent access to shared metadata. Stress repeated
-   updates to the same keys and hash-bucket collisions.
+1. Extend fixed-owner workers to support dynamic reassignment and cross-worker
+   consistency before enabling elasticity or failover.
 2. Refine the coarse index lock and allocation scheduling to reduce stalls
    during concurrent maintenance. Consider compaction of partially live blocks
    separately, preserving reader protection and epoch ownership.

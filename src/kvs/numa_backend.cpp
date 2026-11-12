@@ -48,17 +48,21 @@ struct Message {
     uint64_t key_size = 0, value_size = 0, found = 0;
     char data[metadata_capacity]{};
     dinomo_numa::LogStats logs;
-    uint64_t epoch = 0;
+    uint64_t epoch = 0, worker = 0;
 };
-int control = -1;
+constexpr size_t max_workers = 64;
+size_t worker_count = 1;
+std::vector<int> worker_controls;
+thread_local size_t worker_id = 0;
+thread_local int control = -1;
 pid_t manager = -1;
 char *mapping = nullptr;
 size_t mapping_size = 0;
 uint64_t remote_base = 0;
-uint64_t reads = 0, writes = 0, allocations = 0;
-uint64_t metadata_reads = 0, metadata_writes = 0;
+std::atomic<uint64_t> reads{0}, writes{0}, allocations{0};
+std::atomic<uint64_t> metadata_reads{0}, metadata_writes{0};
 bool reclaim_enabled = false;
-dinomo_numa::LogStats latest_log_stats;
+thread_local dinomo_numa::LogStats latest_log_stats;
 dinomo_numa::ConcurrentOptions concurrent_options;
 struct SharedControl {
     pthread_rwlock_t index_lock;
@@ -68,14 +72,15 @@ struct SharedControl {
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "Shared counters must be lock-free");
 SharedControl *shared_control = nullptr;
 bool index_lock_initialized = false;
-bool async_pending = false, async_complete = false;
-uint64_t async_epoch = 0, async_started = 0, async_completed = 0, ipc_backpressure = 0;
-std::vector<uint64_t> current_grants, sealed_grants;
+thread_local bool async_pending = false, async_complete = false;
+thread_local uint64_t async_epoch = 0;
+std::atomic<uint64_t> async_started{0}, async_completed{0}, ipc_backpressure{0};
+thread_local std::vector<uint64_t> current_grants, sealed_grants;
 ibv_mr local_mr{};
-ibv_qp *local_qps[1]{};
-ibv_cq *local_cqs[1]{};
-uint64_t remote_roots[1]{};
-uint32_t remote_keys[1]{};
+ibv_qp *local_qps[max_workers]{};
+ibv_cq *local_cqs[max_workers]{};
+uint64_t remote_roots[max_workers]{};
+uint32_t remote_keys[max_workers]{};
 
 void require(bool condition, const std::string &message)
 {
@@ -132,7 +137,7 @@ void receive_merge_reply()
 {
     Message reply;
     exchange_bytes(control, &reply, sizeof(reply), false);
-    require(reply.ok == 1 && reply.command == AsyncMerge && reply.epoch == async_epoch,
+    require(reply.ok == 1 && reply.command == AsyncMerge && reply.epoch == async_epoch && reply.worker == worker_id,
             "Concurrent merge failed or reply mismatched");
     latest_log_stats = reply.logs;
     async_pending = false;
@@ -142,6 +147,7 @@ void receive_merge_reply()
 
 Message request(Message message)
 {
+    message.worker = worker_id;
     if (async_pending) {
         ++ipc_backpressure;
         receive_merge_reply();
@@ -149,7 +155,7 @@ Message request(Message message)
     const auto command = message.command;
     exchange_bytes(control, &message, sizeof(message), true);
     exchange_bytes(control, &message, sizeof(message), false);
-    require(message.ok == 1 && message.command == command, "NUMA manager rejected or mismatched request");
+    require(message.ok == 1 && message.command == command && message.worker == worker_id, "NUMA manager rejected or mismatched request");
     latest_log_stats = message.logs;
     return message;
 }
@@ -173,14 +179,15 @@ void *translate(uint64_t address, size_t length)
     return mapping + offset;
 }
 
-void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
+void serve(const std::vector<int> &fds, const std::string &path, size_t bytes, int cpu, int node,
            bool reclaim, size_t block_limit)
 {
+    int fd = fds.front();
     try {
         dinomo_numa::pin_cpu(concurrent_options.manager_cpu >= 0 ? concurrent_options.manager_cpu : cpu);
         memory_policy(node);
         require(setenv("DINOMO_NUMA_POOL_PATH", path.c_str(), 1) == 0, "setenv");
-        farIdx = clht_create(1024, 1, 1, bytes);
+        farIdx = clht_create(1024, 1, worker_count, bytes);
         require(farIdx != nullptr, "Create PMDK pool");
         // Prefaulted tmpfs pool pages retain their remote placement; manager
         // bookkeeping allocated afterward follows the host CPU locally.
@@ -190,27 +197,51 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
         Message hello;
         hello.base = reinterpret_cast<uint64_t>(pop);
         hello.root = reinterpret_cast<uint64_t>(farIdx);
-        exchange_bytes(fd, &hello, sizeof(hello), true);
+        for (int connection : fds) exchange_bytes(connection, &hello, sizeof(hello), true);
 
         // All PMDK allocator calls stay on this single manager thread.
         // The compute process only transfers bytes to allocated log blocks.
-        std::vector<uint64_t> logs;
-        struct BlockState { uint64_t live = 0; bool leased = true, available = false; };
-        struct Reference { uint64_t record, block; };
+        struct WorkerState {
+            std::vector<uint64_t> logs, merged_epoch;
+            uint64_t last_epoch = 0;
+        };
+        std::vector<WorkerState> workers(worker_count);
+        struct BlockState { uint64_t live = 0; bool leased = true, available = false; size_t owner = 0; };
+        struct Reference { uint64_t record, block; size_t owner; };
         std::map<uint64_t, BlockState> blocks;
         std::map<uint64_t, Reference> references;
         std::vector<uint64_t> available;
         dinomo_numa::LogStats stats;
-        std::vector<uint64_t> merged_epoch;
-        uint64_t last_epoch = 0;
+
         // Volatile metadata, like the original storage metadata store. This
         // allocation follows the host-local policy restored after pool creation.
         std::map<std::string, std::string> metadata;
+        std::vector<pollfd> descriptors;
+        for (int connection : fds) descriptors.push_back({connection, POLLIN, 0});
+        size_t next_worker = 0;
         for (;;) {
+            int ready;
+            do { ready = poll(descriptors.data(), descriptors.size(), -1); }
+            while (ready < 0 && errno == EINTR);
+            require(ready > 0, "Poll worker commands");
+            size_t selected_worker = next_worker;
+            for (size_t n = 0; n < worker_count; ++n) {
+                selected_worker = (next_worker + n) % worker_count;
+                if (descriptors[selected_worker].revents) break;
+            }
+            next_worker = (selected_worker + 1) % worker_count;
+            fd = fds[selected_worker];
+            auto &logs = workers[selected_worker].logs;
+            auto &merged_epoch = workers[selected_worker].merged_epoch;
+            auto &last_epoch = workers[selected_worker].last_epoch;
             Message message;
             exchange_bytes(fd, &message, sizeof(message), false);
-            if (message.command == Quit)
+            require(message.worker == selected_worker, "Worker connection identity mismatch");
+            if (message.command == Quit) {
+                require(selected_worker == 0, "Only lifecycle owner may stop manager");
+                exchange_bytes(fd, &message, sizeof(message), true);
                 break;
+            }
             const bool asynchronous = message.command == AsyncMerge;
             if (asynchronous) {
                 require(shared_control && merged_epoch.empty() && message.epoch > last_epoch,
@@ -248,6 +279,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                         blocks.emplace(oid.off, BlockState{});
                         ++stats.fresh_blocks;
                     }
+                    blocks.at(oid.off).owner = selected_worker;
                     auto *block = static_cast<log_block *>(pmemobj_direct(oid));
                     // No index reference, staging reference, spare allocation,
                     // or log-chain reference may survive reuse. The manager is
@@ -279,9 +311,10 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                     merged_epoch = selected;
                     last_epoch = message.epoch;
                 }
-                // Allocation order is log order for this one-worker milestone.
+                // Allocation order is log order within this worker.
                 for (uint64_t offset : selected) {
-                    require(blocks.at(offset).leased && !blocks.at(offset).available,
+                    require(blocks.at(offset).leased && !blocks.at(offset).available &&
+                            blocks.at(offset).owner == selected_worker,
                             "Merge encountered an unleased log");
                     auto *block = static_cast<log_block *>(
                         pmemobj_direct(PMEMoid{pool_uuid, offset}));
@@ -298,8 +331,10 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                                 record->op_type == OP_UPDATE,
                                 "Unsupported operation in NUMA milestone");
                         uint64_t record_offset = pmemobj_oid(record).off;
-                        uint64_t old = clht_update(farIdx, record->key, record_offset);
                         auto previous = references.find(record->key);
+                        require(previous == references.end() || previous->second.owner == selected_worker,
+                                "Key changed compute ownership");
+                        uint64_t old = clht_update(farIdx, record->key, record_offset);
                         if (previous != references.end()) {
                             require(old == previous->second.record && old != 0,
                                     "Index/log ownership mismatch");
@@ -312,7 +347,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                                     "CLHT insert failed");
                         }
                         ++blocks.at(offset).live;
-                        references[record->key] = {record_offset, offset};
+                        references[record->key] = {record_offset, offset, selected_worker};
                         position += sizeof(oplogs) + record->val_len;
                     }
                     block->merged_offset.store(position);
@@ -320,7 +355,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
             } else if (message.command == Release || message.command == ReleaseEpoch) {
                 require(reclaim, "Log release requires reclamation mode");
                 auto *head = static_cast<uint64_t *>(pmemobj_direct(
-                    PMEMoid{pool_uuid, farIdx->log_table_addr}));
+                    PMEMoid{pool_uuid, farIdx->log_table_addr + selected_worker * sizeof(uint64_t)}));
                 std::vector<uint64_t> retired = logs;
                 if (message.command == ReleaseEpoch) {
                     require(message.epoch == last_epoch && message.count == merged_epoch.size() &&
@@ -335,6 +370,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                     size_t visited = 0;
                     while (cursor) {
                         require(++visited <= blocks.size() && blocks.count(cursor) &&
+                                blocks.at(cursor).owner == selected_worker && blocks.at(cursor).leased &&
                                 std::find(retired.begin(), retired.end(), cursor) == retired.end(),
                                 "Published chain references retired epoch");
                         cursor = static_cast<log_block *>(pmemobj_direct(PMEMoid{pool_uuid, cursor}))->next.load();
@@ -342,10 +378,11 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                 } else {
                     require(merged_epoch.empty() && *head == 0, "Compute still publishes a log chain or epoch");
                 }
-                // Release is a quiescent point: the one compute worker has
+                // Release is a quiescent point: this compute worker has
                 // cleared all local references and is blocked on this reply.
                 for (uint64_t offset : retired) {
                     auto *block = static_cast<log_block *>(pmemobj_direct(PMEMoid{pool_uuid, offset}));
+                    require(blocks.at(offset).leased && blocks.at(offset).owner == selected_worker, "Release of unowned log");
                     require(block->merged_offset.load() == block->offset.load(),
                             "Cannot release an unmerged log");
                     blocks.at(offset).leased = false;
@@ -396,7 +433,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
             exchange_bytes(fd, &message, sizeof(message), true);
         }
         pmemobj_close(pop);
-        close(fd);
+        for (int connection : fds) close(connection);
         _exit(0);
     } catch (const std::exception &error) {
         fprintf(stderr, "NUMA storage manager: %s\n", error.what());
@@ -420,9 +457,12 @@ void pin_cpu(int cpu)
 }
 
 void start(const std::string &path, size_t bytes, int cpu, int memory_node,
-           bool reclaim_logs, size_t block_limit, const ConcurrentOptions &concurrent)
+           bool reclaim_logs, size_t block_limit, const ConcurrentOptions &concurrent, size_t workers)
 {
     require(manager == -1, "NUMA backend already started");
+    require(workers > 0 && workers <= max_workers, "NUMA supports 1..64 workers");
+    require(workers == 1 || concurrent.enabled, "Multiple workers require protected concurrent mode");
+    worker_count = workers;
     require(!concurrent.enabled || reclaim_logs, "Concurrent merge requires reclamation");
     require(!concurrent.enabled || kLogCacheLen == unlimited_log_cache,
             "Concurrent merge requires log-cache-len=10000000 (no premature copy pruning)");
@@ -445,27 +485,33 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node,
         index_lock_initialized = true;
         pthread_rwlockattr_destroy(&attributes);
     }
-    int sockets[2];
-    require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
-    // Bound startup and control waits if the manager fails.
+    std::vector<int> manager_controls;
     timeval timeout{30, 0};
-    for (int fd : sockets) {
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    for (size_t i = 0; i < worker_count; ++i) {
+        int sockets[2];
+        require(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0, "socketpair");
+        worker_controls.push_back(sockets[0]);
+        manager_controls.push_back(sockets[1]);
+        for (int fd : sockets) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        }
     }
     manager = fork();
     require(manager >= 0, "fork storage manager");
     if (manager == 0) {
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
-        close(sockets[0]);
-        serve(sockets[1], path, bytes, cpu, memory_node, reclaim_logs, block_limit);
+        for (int fd : worker_controls) close(fd);
+        serve(manager_controls, path, bytes, cpu, memory_node, reclaim_logs, block_limit);
     }
-    close(sockets[1]);
-    control = sockets[0];
+    for (int fd : manager_controls) close(fd);
+    control = worker_controls[0];
     Message hello;
-    exchange_bytes(control, &hello, sizeof(hello), false);
-    require(hello.ok == 1, "Storage manager startup");
+    for (int fd : worker_controls) {
+        exchange_bytes(fd, &hello, sizeof(hello), false);
+        require(hello.ok == 1, "Storage manager startup");
+    }
     remote_base = hello.base;
     int file = open(path.c_str(), O_RDWR | O_CLOEXEC);
     require(file >= 0, "Open shared PMDK pool");
@@ -476,22 +522,22 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node,
     require(mapping != MAP_FAILED, "Map shared pool");
     (void)madvise(mapping, bytes, MADV_NOHUGEPAGE);
 
-    config_info.threads_per_memory = 1;
+    config_info.threads_per_memory = worker_count;
     config_info.threads_per_storage = 1;
     config_info.num_initial_storage_nodes = 1;
     config_info.msg_size = 64 * 1024;
     config_info.rank = 0;
-    ib_res.num_qps = 1;
+    ib_res.num_qps = worker_count;
     ib_res.qp = local_qps;
     ib_res.cq = local_cqs;
     ib_res.mr_buf = &local_mr;
     ib_res.mr_pool = &local_mr;
-    ib_res.ib_buf_size = config_info.msg_size;
+    ib_res.ib_buf_size = config_info.msg_size * worker_count;
     ib_res.ib_buf = static_cast<char *>(calloc(1, ib_res.ib_buf_size));
-    ib_res.ib_pool_size = sizeof(log_block) + MAX_LOG_BLOCK_LEN;
+    ib_res.ib_pool_size = (sizeof(log_block) + MAX_LOG_BLOCK_LEN) * worker_count;
     ib_res.ib_pool = static_cast<char *>(calloc(1, ib_res.ib_pool_size));
     require(ib_res.ib_buf && ib_res.ib_pool, "Allocate local staging buffers");
-    remote_roots[0] = hello.root;
+    std::fill(remote_roots, remote_roots + worker_count, hello.root);
     ib_res.raddr_pool = remote_roots;
     ib_res.rkey_pool = remote_keys;
     fprintf(stdout, "NUMA backend: compute_cpu=%d manager_cpu=%d memory_node=%d\n"
@@ -500,6 +546,13 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node,
             remote_base, static_cast<void *>(mapping),
             hello.root - remote_base);
     verify_placement(memory_node);
+}
+
+void bind_worker(size_t id)
+{
+    require(id < worker_count && id < worker_controls.size(), "Invalid NUMA worker ID");
+    worker_id = id;
+    control = worker_controls[id];
 }
 
 void allocate_logs(uint64_t *addresses, size_t count)
@@ -534,6 +587,7 @@ void begin_merge(const std::vector<uint64_t> &addresses)
     sealed_grants = addresses;
     Message message;
     message.command = AsyncMerge;
+    message.worker = worker_id;
     message.epoch = ++async_epoch;
     message.count = addresses.size();
     std::copy(addresses.begin(), addresses.end(), message.addresses);
@@ -689,28 +743,37 @@ uint64_t allocation_count() { return allocations; }
 
 void stop()
 {
+    // Called only after all compute workers have joined.
+    if (mapping && mapping != MAP_FAILED && !worker_controls.empty()) {
+        bind_worker(0);
+        try { latest_log_stats = log_stats(); } catch (const std::exception &) {}
+    }
     if (shared_control)
         fprintf(stdout, "NUMA concurrent: started=%lu completed=%lu writes_during_merge=%lu staged_reads_during_merge=%lu read_locks=%lu reader_waits=%lu writer_waits=%lu ipc_backpressure=%lu\n",
-            async_started, async_completed, shared_control->writes_during_merge.load(),
+            async_started.load(), async_completed.load(), shared_control->writes_during_merge.load(),
             shared_control->staged_reads_during_merge.load(), shared_control->read_locks.load(),
-            shared_control->reader_waits.load(), shared_control->writer_waits.load(), ipc_backpressure);
+            shared_control->reader_waits.load(), shared_control->writer_waits.load(), ipc_backpressure.load());
     if (mapping && mapping != MAP_FAILED)
         fprintf(stdout, "NUMA counters: shared_reads=%lu shared_writes=%lu allocated_logs=%lu metadata_gets=%lu metadata_puts=%lu\n",
-                reads, writes, allocations, metadata_reads, metadata_writes);
+                reads.load(), writes.load(), allocations.load(), metadata_reads.load(), metadata_writes.load());
     if (mapping && mapping != MAP_FAILED)
         fprintf(stdout, "NUMA GC: enabled=%d fresh_blocks=%lu reused_blocks=%lu reclaimed_blocks=%lu live_blocks=%lu free_blocks=%lu leased_blocks=%lu live_records=%lu logical_log_bytes=%lu\n",
                 reclaim_enabled, latest_log_stats.fresh_blocks, latest_log_stats.reused_blocks,
                 latest_log_stats.reclaimed_blocks, latest_log_stats.live_blocks,
                 latest_log_stats.free_blocks, latest_log_stats.leased_blocks,
-                latest_log_stats.live_records, allocations * (sizeof(log_block) + MAX_LOG_BLOCK_LEN));
+                latest_log_stats.live_records, allocations.load() * (sizeof(log_block) + MAX_LOG_BLOCK_LEN));
     bool manager_ok = true;
     if (control >= 0) {
         Message quit;
         quit.command = Quit;
-        (void)send(control, &quit, sizeof(quit), MSG_NOSIGNAL);
-        close(control);
+        // Wait for Quit acknowledgement before closing peer connections: a
+        // peer HUP must not race the manager's round-robin command selection.
+        try { (void)request(quit); }
+        catch (const std::exception &) { manager_ok = false; }
         control = -1;
     }
+    for (int fd : worker_controls) close(fd);
+    worker_controls.clear();
     if (manager > 0) {
         int status = 0;
         pid_t reaped = 0;
@@ -728,7 +791,7 @@ void stop()
             while (reaped < 0 && errno == EINTR);
         }
         manager = -1;
-        manager_ok = !forced && reaped > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        manager_ok = manager_ok && !forced && reaped > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
     if (mapping && mapping != MAP_FAILED)
         munmap(mapping, mapping_size);

@@ -9,11 +9,16 @@
 #ifdef DINOMO_NUMA_SERVER
 #include "kvs/numa_backend.hpp"
 #include <csignal>
+#include <atomic>
 #include <stdexcept>
 #include <unistd.h>
+#include <sys/syscall.h>
 namespace {
-volatile sig_atomic_t numa_stop_requested = 0;
-void request_numa_stop(int) { numa_stop_requested = 1; }
+std::atomic<bool> numa_stop_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "Signal stop flag must be lock-free");
+std::atomic<bool> numa_worker_failed{false};
+std::vector<int> numa_worker_cpus;
+void request_numa_stop(int) { numa_stop_requested.store(true, std::memory_order_relaxed); }
 std::string numa_config_path = "conf/dinomo-numa.yml";
 std::string numa_pool_path;
 std::string numa_pool_directory;
@@ -85,6 +90,12 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
          Address seed_ip, vector<Address> routing_ips,
          vector<Address> monitoring_ips, Address management_ip)
 {
+#ifdef DINOMO_NUMA_SERVER
+    dinomo_numa::bind_worker(thread_id);
+    dinomo_numa::pin_cpu(numa_worker_cpus.at(thread_id));
+    fprintf(stdout, "NUMA worker placement: worker=%u tid=%ld cpu=%d\n",
+            thread_id, syscall(SYS_gettid), sched_getcpu());
+#endif
     /* ADDED: STEP1 progress marker — print to stderr immediately on entry so that if the
      * kvs process hangs or crashes before spdlog is set up, there is still evidence in the
      * log that this thread started. The original code had no such diagnostic prints. */
@@ -689,11 +700,12 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
     // enter event loop
 #ifdef DINOMO_NUMA_SERVER
     kvs_->configure_merge(numa_merge_writes, numa_merge_ms);
-    std::cout << "NUMA server ready: one worker; published writes with deferred merge" << std::endl;
+    fprintf(stdout, "NUMA server ready: worker=%u; published writes with deferred merge\n", thread_id);
+    fflush(stdout);
 #endif
     while (
 #ifdef DINOMO_NUMA_SERVER
-        !numa_stop_requested
+        !numa_stop_requested && !numa_worker_failed.load()
 #else
         true
 #endif
@@ -1564,13 +1576,13 @@ int main(int argc, char *argv[])
 #ifdef ENABLE_DINOMO_KVS
 #ifndef ENABLE_CLOVER_KVS
 #ifdef DINOMO_NUMA_SERVER
-    if (kSelfTier != Tier::MEMORY || kMemoryThreadCount != 1 ||
+    if (kSelfTier != Tier::MEMORY || (kMemoryThreadCount == 0 || kMemoryThreadCount > 64) ||
         kStorageThreadCount != 0 || kDefaultGlobalMemoryReplication != 1 ||
         kDefaultGlobalStorageReplication != 0 || kDefaultLocalReplication != 1 ||
         kEnableCaching || kEnableAdaptiveCache || kEnableBatching ||
         kEnableElasticity || kEnableSelectiveRep || kEnablePerfMonitor ||
         mgmt_ip != "NULL")
-        throw std::runtime_error("NUMA server requires one uncached, unbatched memory worker, no replication or management policies, and mgmt_ip NULL");
+        throw std::runtime_error("NUMA server requires 1..64 uncached, unbatched memory workers, no replication or management policies, and mgmt_ip NULL");
     if (MAX_PREALLOC_NUM == 0 || MAX_PREALLOC_NUM > 64 ||
         MAX_LOG_BLOCK_LEN + LOG_BLOCK_HEADER_LEN > 64 * 1024)
         throw std::runtime_error("NUMA server requires 1..64 preallocated blocks and log blocks <= 64 KiB");
@@ -1585,6 +1597,15 @@ int main(int argc, char *argv[])
     concurrency.start_delay_ms = numa["merge-start-delay-ms"] ? numa["merge-start-delay-ms"].as<unsigned>() : 0;
     concurrency.merge_delay_ms = numa["merge-lock-delay-ms"] ? numa["merge-lock-delay-ms"].as<unsigned>() : 0;
     concurrency.read_delay_ms = numa["reader-delay-ms"] ? numa["reader-delay-ms"].as<unsigned>() : 0;
+    if (numa["worker-cpus"]) numa_worker_cpus = numa["worker-cpus"].as<std::vector<int>>();
+    else numa_worker_cpus.assign(kMemoryThreadCount, numa["host-cpu"].as<int>());
+    if (numa_worker_cpus.size() != kMemoryThreadCount)
+        throw std::runtime_error("NUMA worker-cpus must contain one CPU per worker");
+    for (int cpu : numa_worker_cpus)
+        if (cpu < 0 || cpu >= CPU_SETSIZE)
+            throw std::runtime_error("Invalid NUMA worker CPU");
+    if (kMemoryThreadCount > 1 && !concurrency.enabled)
+        throw std::runtime_error("NUMA multiple workers require concurrent-merge for reader protection");
     if (concurrency.enabled && (!numa_merge_writes || numa_merge_writes > 16))
         throw std::runtime_error("Concurrent merge requires a write limit between 1 and 16");
     std::string pool_template = numa["pool-directory"].as<std::string>() + "/dinomo-server-XXXXXX";
@@ -1598,7 +1619,7 @@ int main(int argc, char *argv[])
     dinomo_numa::start(numa_pool_path, kStorageNodeCapacity,
                       numa["host-cpu"].as<int>(), numa_memory_node,
                       numa["reclaim-logs"] ? numa["reclaim-logs"].as<bool>() : true,
-                      numa["log-block-limit"] ? numa["log-block-limit"].as<uint64_t>() : 0, concurrency);
+                      numa["log-block-limit"] ? numa["log-block-limit"].as<uint64_t>() : 0, concurrency, kMemoryThreadCount);
     if (numa_stop_requested) return 0;
 #else
     ib_init(total_available_memory_nodes, num_initial_memory_nodes, 
@@ -1630,7 +1651,22 @@ int main(int argc, char *argv[])
 #else
 #ifndef ENABLE_CLOVER_KVS
 #ifdef DINOMO_NUMA_SERVER
-    run<DinomoECKVS>(0, public_ip, private_ip, seed_ip, routing_ips, monitoring_ips, mgmt_ip);
+    auto numa_run = [&](unsigned id) {
+        try {
+            run<DinomoECKVS>(id, public_ip, private_ip, seed_ip, routing_ips, monitoring_ips, mgmt_ip);
+        } catch (const std::exception &error) {
+            std::cerr << "NUMA worker " << id << " failed: " << error.what() << '\n';
+            numa_worker_failed.store(true);
+        }
+    };
+    try {
+        for (unsigned id = 1; id < kThreadNum; ++id) worker_threads.emplace_back(numa_run, id);
+    } catch (...) {
+        numa_worker_failed.store(true);
+        for (auto &worker : worker_threads) worker.join();
+        throw;
+    }
+    numa_run(0);
 #else
     if (kEnableCaching) {
         if (kEnableAdaptiveCache) {
@@ -1664,10 +1700,10 @@ int main(int argc, char *argv[])
 #endif
 
     // join on all threads to make sure they finish before exiting
-    for (unsigned tid = 1; tid < kThreadNum; tid++)
-    {
-        worker_threads[tid].join();
-    }
+    for (auto &worker : worker_threads) worker.join();
+#ifdef DINOMO_NUMA_SERVER
+    if (numa_worker_failed.load()) throw std::runtime_error("NUMA compute worker failed");
+#endif
 
 #ifdef ENABLE_DINOMO_KVS
 #ifndef ENABLE_CLOVER_KVS

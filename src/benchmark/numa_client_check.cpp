@@ -58,19 +58,21 @@ int main(int argc, char **argv)
     try {
         const unsigned keys = argc >= 2 ? std::stoul(argv[1]) : 256;
         const unsigned rounds = argc >= 3 ? std::stoul(argv[2]) : 0;
-        const unsigned idle_ms = argc == 4 ? std::stoul(argv[3]) : 0;
-        if (argc > 4 || keys < 1 || keys > 2000 || rounds > 4096 || (rounds && keys % 2) || idle_ms > 10000)
-            throw std::runtime_error("Usage: dinomo-numa-client-check [NUM_KEYS] [GC_ROUNDS] [IDLE_MS]");
-        auto key_name = [rounds](unsigned key) {
+        const unsigned idle_ms = argc >= 4 ? std::stoul(argv[3]) : 0;
+        const unsigned workers = argc >= 5 ? std::stoul(argv[4]) : 1;
+        const unsigned client_id = argc >= 6 ? std::stoul(argv[5]) : 0;
+        if (argc > 6 || workers < 1 || workers > 64 || client_id >= workers || keys < 1 || keys > 2000 || rounds > 4096 || (rounds && keys % 2) || idle_ms > 10000)
+            throw std::runtime_error("Usage: dinomo-numa-client-check [NUM_KEYS] [GC_ROUNDS] [IDLE_MS] [WORKERS] [CLIENT_ID]");
+        auto key_name = [rounds, client_id](unsigned key) {
             // Collide in the initial CLHT table when stressing reclamation.
-            return std::to_string(rounds ? 1 + 1024UL * (key - 1) : key);
+            return std::to_string(client_id * 10000000UL + (rounds ? 1 + 1024UL * (key - 1) : key));
         };
-        kTierMetadata[Tier::MEMORY] = TierMetadata(Tier::MEMORY, 1, 1, 16 * 1024 * 1024);
+        kTierMetadata[Tier::MEMORY] = TierMetadata(Tier::MEMORY, workers, 1, 16 * 1024 * 1024);
         kTierMetadata[Tier::STORAGE] = TierMetadata(Tier::STORAGE, 0, 0, 256 * 1024 * 1024);
-        KvsClient client({UserRoutingThread("127.0.0.1", 0)}, "127.0.0.1", 0, 2000, false);
+        KvsClient client({UserRoutingThread("127.0.0.1", 0)}, "127.0.0.1", client_id, 2000, false);
         unsigned long long timestamp = 1;
         read(client, "99999999", "", true);
-        const std::string meta = "ANNA_METADATA|numa-correctness";
+        const std::string meta = "ANNA_METADATA|numa-correctness-" + std::to_string(client_id);
         read(client, meta, "", true);
         write(client, meta, "metadata-v1", timestamp++, false);
         read(client, meta, "metadata-v1");

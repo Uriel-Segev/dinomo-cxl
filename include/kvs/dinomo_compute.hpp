@@ -40,6 +40,10 @@ public:
     Dinomo(uint64_t cache_size = 1024*1024*1024UL, uint16_t tid = 0, bool enable_batch = false, double weight_or_value_ratio = 5)
     {
         thread_id = tid;
+#ifdef DINOMO_NUMA_MILESTONE
+        dinomo_numa::bind_worker(tid);
+        dinomo_numa::IndexReadGuard initialization_reader;
+#endif
         non_replicated_alloc = 0;
         replicated_alloc = 0;
         replicated_alloc_offset = 0;
@@ -1722,10 +1726,11 @@ std::pair<char *, size_t> Dinomo<T>::getMeta(const char *key, const size_t key_l
 #ifdef DINOMO_NUMA_SERVER
     auto numa_result = dinomo_numa::get_metadata(key, key_len);
     if (!numa_result.first) return {nullptr, 0};
-    if (numa_result.second.size() > ib_res.ib_buf_size)
+    if (numa_result.second.size() > static_cast<size_t>(config_info.msg_size))
         throw std::runtime_error("NUMA metadata reply exceeds compute buffer");
-    memcpy(ib_res.ib_buf, numa_result.second.data(), numa_result.second.size());
-    return {ib_res.ib_buf, numa_result.second.size()};
+    char *metadata_buffer = ib_res.ib_buf + config_info.msg_size * thread_id;
+    memcpy(metadata_buffer, numa_result.second.data(), numa_result.second.size());
+    return {metadata_buffer, numa_result.second.size()};
 #endif
 #ifdef SEKWON_DEBUG
     printf("%s\n", __func__);
@@ -1853,7 +1858,8 @@ void Dinomo<T>::begin_async_merge()
         throw std::runtime_error("Concurrent merge requires an active unbatched log");
     publish();
     auto sealed = dinomo_numa::seal_grants();
-    auto *pool = reinterpret_cast<log_block *>(ib_res.ib_pool);
+    auto *pool = reinterpret_cast<log_block *>(ib_res.ib_pool +
+        (sizeof(log_block) + MAX_LOG_BLOCK_LEN) * static_cast<uint64_t>(thread_id));
     memcpy(BFilter->local_log_block, pool, sizeof(log_block) + MAX_LOG_BLOCK_LEN);
     push_log_list();
     BFilter = nullptr;

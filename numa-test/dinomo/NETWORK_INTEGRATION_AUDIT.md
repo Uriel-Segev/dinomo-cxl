@@ -6,6 +6,10 @@ the detailed audit sections preserve findings from before integration.
 The existing milestone remains the correctness baseline; its local and remote
 controls have passed on the user's c8220 host.
 
+An experimental fixed-owner multiworker extension is described in
+[MULTIWORKER.md](MULTIWORKER.md). The historical single-worker acceptance
+results below remain the baseline.
+
 ## Implementation progress after the audit
 
 The opt-in `dinomo-kvs-numa` target now excludes the RDMA initialization sources,

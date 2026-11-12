@@ -20,6 +20,8 @@ def exercise(root, args, mode):
                "--manager-cpu", str(args.manager_cpu), "--memory-node", str(args.memory_node),
                "--client-check", "--keys", "32", "--merge-writes", "16", "--merge-ms", "0",
                "--concurrent", "--merge-lock-delay-ms", "1000" if mode == "manager-death" else "100"]
+    command += ["--workers", str(args.workers)]
+    if args.worker_cpus: command += ["--worker-cpus", args.worker_cpus]
     with output_path.open("w") as output:
         process = subprocess.Popen(command, cwd=root, stdout=output, stderr=output)
         evidence = None
@@ -58,7 +60,7 @@ def exercise(root, args, mode):
                     raise RuntimeError("Reader lock watchdog was not exercised")
             else:
                 summary = re.search(r"NUMA concurrent: started=(\d+) completed=(\d+)", log)
-                if not summary or summary.group(1) != summary.group(2) or "pending_writes=0" not in log:
+                if not summary or summary.group(1) != summary.group(2) or log.count("pending_writes=0") != args.workers:
                     raise RuntimeError("Interrupted shutdown did not drain the active epoch")
             (evidence / "FAULT_PASS").write_text(f"{mode}: bounded exit, manager/router cleanup, pool removal passed.\n")
             print(f"PASS: {mode}; evidence: {evidence}")
@@ -71,6 +73,8 @@ def exercise(root, args, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", default="build/numa")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--worker-cpus")
     parser.add_argument("--host-cpu", type=int, default=2)
     parser.add_argument("--manager-cpu", type=int, default=4)
     parser.add_argument("--memory-node", type=int, default=0)

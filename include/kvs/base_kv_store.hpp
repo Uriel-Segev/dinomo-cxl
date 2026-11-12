@@ -57,14 +57,23 @@ class DinomoKVStore {
         uint64_t merge_write_limit = 16, merge_interval_ms = 20;
         uint64_t threshold_merges = 0, timer_merges = 0, shutdown_merges = 0;
         uint64_t staging_gets = 0, index_gets = 0;
+        bool asynchronous_merge = false;
         std::chrono::steady_clock::time_point pending_since;
         void merge_pending(uint64_t &counter) {
-            db.merge(true);
+            if (dinomo_numa::concurrent_enabled()) {
+                if (asynchronous_merge) {
+                    db.finish_async_merge(true);
+                    asynchronous_merge = false;
+                }
+                db.begin_async_merge();
+                asynchronous_merge = true;
+            } else db.merge(true);
             pending_writes = 0;
             ++counter;
         }
         void publish_write() {
             db.publish();
+            dinomo_numa::note_write();
             if (pending_writes == 0) pending_since = std::chrono::steady_clock::now();
             ++pending_writes;
             ++published_writes;
@@ -87,7 +96,10 @@ class DinomoKVStore {
             auto val = db.get(k, key_len);
 #ifdef DINOMO_NUMA_SERVER
             if (val.second) {
-                if (db.staged_read_count() != before) ++staging_gets;
+                if (db.staged_read_count() != before) {
+                    ++staging_gets;
+                    dinomo_numa::note_staged_read();
+                }
                 else ++index_gets;
             }
 #endif
@@ -165,6 +177,12 @@ class DinomoKVStore {
         }
 
         void merge(bool clear_cache) {
+#ifdef DINOMO_NUMA_SERVER
+            if (asynchronous_merge) {
+                db.finish_async_merge(true);
+                asynchronous_merge = false;
+            }
+#endif
             db.merge(clear_cache);
 #ifdef DINOMO_NUMA_SERVER
             pending_writes = 0;
@@ -179,6 +197,7 @@ class DinomoKVStore {
             merge_interval_ms = milliseconds;
         }
         void maybe_merge() {
+            if (asynchronous_merge && db.finish_async_merge(false)) asynchronous_merge = false;
             if (!pending_writes) return;
             if (merge_write_limit && pending_writes >= merge_write_limit)
                 merge_pending(threshold_merges);
@@ -187,7 +206,19 @@ class DinomoKVStore {
                 merge_pending(timer_merges);
         }
         void finish_writes() {
-            if (pending_writes) merge_pending(shutdown_merges);
+            if (asynchronous_merge) {
+                db.finish_async_merge(true);
+                asynchronous_merge = false;
+            }
+            if (pending_writes) {
+                // Shutdown is an explicit quiescent drain, not another async epoch.
+                db.merge(true);
+                pending_writes = 0;
+                ++shutdown_merges;
+            } else if (dinomo_numa::concurrent_enabled()) {
+                // Even a fully merged epoch can leave unused next-epoch credits.
+                db.merge(true);
+            }
             fprintf(stdout, "NUMA merge: published_writes=%lu threshold_merges=%lu timer_merges=%lu shutdown_merges=%lu staging_gets=%lu index_gets=%lu pending_writes=%lu\n",
                 published_writes, threshold_merges, timer_merges, shutdown_merges,
                 staging_gets, index_gets, pending_writes);

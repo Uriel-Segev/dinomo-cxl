@@ -108,6 +108,11 @@ void run(unsigned thread_id, Address public_ip, Address private_ip,
 
     // prepare the zmq context
     zmq::context_t context(1);
+#ifdef DINOMO_NUMA_SERVER
+    // Shutdown must not wait forever for responses to a disconnected client.
+    if (context.setctxopt(ZMQ_BLOCKY, 0) != 0)
+        throw std::runtime_error("Cannot configure bounded NUMA messaging teardown");
+#endif
 
     auto res = context.setctxopt(ZMQ_MAX_SOCKETS, kMaxSocketNumber);
     if (res == 0)
@@ -1574,6 +1579,14 @@ int main(int argc, char *argv[])
     numa_merge_ms = numa["merge-interval-ms"] ? numa["merge-interval-ms"].as<uint64_t>() : 20;
     if (!numa_merge_writes && !numa_merge_ms)
         throw std::runtime_error("NUMA merge needs a write limit or a timer");
+    dinomo_numa::ConcurrentOptions concurrency;
+    concurrency.enabled = numa["concurrent-merge"] ? numa["concurrent-merge"].as<bool>() : false;
+    concurrency.manager_cpu = numa["manager-cpu"] ? numa["manager-cpu"].as<int>() : -1;
+    concurrency.start_delay_ms = numa["merge-start-delay-ms"] ? numa["merge-start-delay-ms"].as<unsigned>() : 0;
+    concurrency.merge_delay_ms = numa["merge-lock-delay-ms"] ? numa["merge-lock-delay-ms"].as<unsigned>() : 0;
+    concurrency.read_delay_ms = numa["reader-delay-ms"] ? numa["reader-delay-ms"].as<unsigned>() : 0;
+    if (concurrency.enabled && (!numa_merge_writes || numa_merge_writes > 16))
+        throw std::runtime_error("Concurrent merge requires a write limit between 1 and 16");
     std::string pool_template = numa["pool-directory"].as<std::string>() + "/dinomo-server-XXXXXX";
     std::vector<char> pool_directory(pool_template.begin(), pool_template.end());
     pool_directory.push_back('\0');
@@ -1585,7 +1598,7 @@ int main(int argc, char *argv[])
     dinomo_numa::start(numa_pool_path, kStorageNodeCapacity,
                       numa["host-cpu"].as<int>(), numa_memory_node,
                       numa["reclaim-logs"] ? numa["reclaim-logs"].as<bool>() : true,
-                      numa["log-block-limit"] ? numa["log-block-limit"].as<uint64_t>() : 0);
+                      numa["log-block-limit"] ? numa["log-block-limit"].as<uint64_t>() : 0, concurrency);
     if (numa_stop_requested) return 0;
 #else
     ib_init(total_available_memory_nodes, num_initial_memory_nodes, 

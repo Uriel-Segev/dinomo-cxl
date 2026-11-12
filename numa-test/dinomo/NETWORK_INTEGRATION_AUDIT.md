@@ -212,6 +212,8 @@ placement verification samples 256 pages rather than every page in the pool.
    Save commit ID, config, topology, placement results, client/server/manager
    logs, and successful resource/CPU cleanup. Include failure/interruption checks.
 
-No performance claim is part of this acceptance target. Multiworker ownership,
-background merge/reclamation, durability, recovery, and actual CXL hardware
-evaluation remain later milestones.
+No performance claim is part of this acceptance target. The later opt-in
+[concurrent milestone](CONCURRENT_MERGE.md) implements sealed-log manager merge,
+protected index reads, and epoch-specific reclamation for one compute worker.
+Multiworker ownership, durability, recovery, and actual CXL hardware evaluation
+remain later milestones.

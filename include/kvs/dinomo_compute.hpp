@@ -128,6 +128,8 @@ public:
     void flush();
 #ifdef DINOMO_NUMA_SERVER
     void publish();
+    void begin_async_merge();
+    bool finish_async_merge(bool wait);
     uint64_t staged_read_count() const { return log_hit_counter; }
 #endif
 
@@ -592,6 +594,9 @@ template <typename T>
 void Dinomo<T>::preallocate_log_blocks(uint32_t lkey_buf, struct ibv_qp *qp, char *buf_ptr, struct ibv_cq *cq, struct ibv_wc *wc, int num_wc)
 {
 #ifdef DINOMO_NUMA_MILESTONE
+    if (dinomo_numa::concurrent_enabled())
+        for (uint64_t i = 0; i < MAX_PREALLOC_NUM; ++i)
+            if (log_blocks_raddrs[i]) return;
     dinomo_numa::allocate_logs(log_blocks_raddrs, MAX_PREALLOC_NUM);
     return;
 #endif
@@ -1562,6 +1567,9 @@ std::pair<char *, size_t> Dinomo<T>::get(const uint64_t key, const size_t key_le
         }
         else
         {
+#ifdef DINOMO_NUMA_SERVER
+            dinomo_numa::IndexReadGuard reader;
+#endif
             while (1)
             {
                 uint64_t snapshot_rdma_read_counter = rdma_read_counter;
@@ -1571,6 +1579,11 @@ std::pair<char *, size_t> Dinomo<T>::get(const uint64_t key, const size_t key_le
                 config_info.rank, &rdma_read_counter, &rdma_read_payload);
                 if (getVal == 0)
                     return std::make_pair(nullptr, 0);
+#ifdef DINOMO_NUMA_SERVER
+                // The shared-index reference remains pinned until all value
+                // bytes have been copied into this process's private buffer.
+                dinomo_numa::reader_pause();
+#endif
                 
                 post_read_signaled_blocking_profile(sizeof(oplogs), lkey_buf, 0, qp, buf_ptr, 
                         h->remote_start_addr + getVal, ib_res.rkey_pool[thread_id], cq, 
@@ -1831,6 +1844,57 @@ void Dinomo<T>::publish()
         reinterpret_cast<char *>(pool) + sizeof(uint32_t), non_replicated_alloc + sizeof(uint32_t),
         ib_res.rkey_pool[thread_id], ib_res.cq[thread_id], &rdma_write_counter, &rdma_write_payload);
     std::atomic_thread_fence(std::memory_order_release);
+}
+
+template <typename T>
+void Dinomo<T>::begin_async_merge()
+{
+    if (!non_replicated_alloc || batching)
+        throw std::runtime_error("Concurrent merge requires an active unbatched log");
+    publish();
+    auto sealed = dinomo_numa::seal_grants();
+    auto *pool = reinterpret_cast<log_block *>(ib_res.ib_pool);
+    memcpy(BFilter->local_log_block, pool, sizeof(log_block) + MAX_LOG_BLOCK_LEN);
+    push_log_list();
+    BFilter = nullptr;
+    pool->offset.store(0);
+    pool->merged_offset.store(0);
+    pool->valid_counter.store(0);
+    pool->local_invalid_counter.store(0);
+    pool->global_invalid_counter.store(0);
+    pool->next.store(0);
+    non_replicated_alloc = 0;
+    memset(log_blocks_raddrs, 0, sizeof(uint64_t) * MAX_PREALLOC_NUM);
+    uint64_t empty = 0;
+    post_write_signaled_blocking_profile(sizeof(empty), ib_res.mr_buf->lkey, 0,
+        ib_res.qp[thread_id], reinterpret_cast<char *>(&empty), mapping_table_raddr(config_info.rank),
+        ib_res.rkey_pool[thread_id], ib_res.cq[thread_id], &rdma_write_counter, &rdma_write_payload);
+    // Obtain credits for the new epoch before submitting the old epoch, so
+    // writes need not immediately block on the manager's busy control socket.
+    dinomo_numa::allocate_logs(log_blocks_raddrs, MAX_PREALLOC_NUM);
+    dinomo_numa::begin_merge(sealed);
+}
+
+template <typename T>
+bool Dinomo<T>::finish_async_merge(bool wait)
+{
+    if (!dinomo_numa::poll_merge(wait)) return false;
+    const auto &sealed = dinomo_numa::merging_logs();
+    for (auto it = filterList->begin(); it != filterList->end();) {
+        auto *copy = *it;
+        if (std::find(sealed.begin(), sealed.end(), copy->raddr) != sealed.end()) {
+            free(copy->bf);
+            free(copy->local_log_block);
+            free(copy);
+            it = filterList->erase(it);
+        } else ++it;
+    }
+    cache->clear();
+    for (auto entry : indirect_pointer_cache)
+        if (std::get<3>(entry.second)) free(std::get<3>(entry.second));
+    indirect_pointer_cache.clear();
+    dinomo_numa::release_merged_logs();
+    return true;
 }
 #endif
 

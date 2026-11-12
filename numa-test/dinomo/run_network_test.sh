@@ -15,11 +15,22 @@ MERGE_WRITES=${MERGE_WRITES:-16}
 MERGE_MS=${MERGE_MS:-20}
 IDLE_MS=${IDLE_MS:-0}
 REQUIRE_DEFERRED=${REQUIRE_DEFERRED:-0}
+CONCURRENT_MERGE=${CONCURRENT_MERGE:-0}
+MANAGER_CPU=${MANAGER_CPU:-$HOST_CPU}
+MERGE_START_DELAY_MS=${MERGE_START_DELAY_MS:-0}
+MERGE_LOCK_DELAY_MS=${MERGE_LOCK_DELAY_MS:-0}
+READER_DELAY_MS=${READER_DELAY_MS:-0}
+REQUIRE_OVERLAP=${REQUIRE_OVERLAP:-0}
+REQUIRE_BACKPRESSURE=${REQUIRE_BACKPRESSURE:-0}
 BUILD_DIR=${BUILD_DIR:-$ROOT/build/numa}
 offline=1
 if [[ ${1:-} == --no-offline ]]; then offline=0; shift; fi
 [[ $# == 0 ]] || { echo "Usage: $0 [--no-offline]" >&2; exit 2; }
-for value in "$HOST_CPU" "$HOST_NODE" "$MEMORY_NODE" "$NUM_KEYS" "$GC_ROUNDS" "$POOL_MB" "$LOG_BLOCK_LIMIT" "$RECLAIM_LOGS" "$EXPECT_EXHAUSTION" "$MERGE_WRITES" "$MERGE_MS" "$IDLE_MS" "$REQUIRE_DEFERRED"; do
+for value in "$HOST_CPU" "$HOST_NODE" "$MEMORY_NODE" "$NUM_KEYS" \
+  "$GC_ROUNDS" "$POOL_MB" "$LOG_BLOCK_LIMIT" "$RECLAIM_LOGS" "$EXPECT_EXHAUSTION" \
+  "$MERGE_WRITES" "$MERGE_MS" "$IDLE_MS" "$REQUIRE_DEFERRED" "$CONCURRENT_MERGE" \
+  "$MANAGER_CPU" "$MERGE_START_DELAY_MS" "$MERGE_LOCK_DELAY_MS" "$READER_DELAY_MS" \
+  "$REQUIRE_OVERLAP" "$REQUIRE_BACKPRESSURE"; do
   [[ $value =~ ^[0-9]+$ ]] || { echo "Expected numeric settings" >&2; exit 2; }
 done
 (( NUM_KEYS >= 1 && NUM_KEYS <= 2000 )) || { echo "NUM_KEYS must be 1..2000" >&2; exit 2; }
@@ -55,6 +66,9 @@ args=()
 if (( ! RECLAIM_LOGS )); then args+=(--no-reclaim); fi
 if (( EXPECT_EXHAUSTION )); then args+=(--expect-exhaustion); fi
 if (( REQUIRE_DEFERRED )); then args+=(--require-deferred); fi
+if (( CONCURRENT_MERGE )); then args+=(--concurrent); fi
+if (( REQUIRE_OVERLAP )); then args+=(--require-overlap); fi
+if (( REQUIRE_BACKPRESSURE )); then args+=(--require-backpressure); fi
 if ((offline)); then
   sudo "$SCRIPT_DIR/../numa_cpu_control.sh" offline "$MEMORY_NODE"
   changed=1
@@ -63,7 +77,9 @@ fi
 python3 "$SCRIPT_DIR/test_server_startup.py" --build-dir "$BUILD_DIR" \
   --host-cpu "$HOST_CPU" --memory-node "$MEMORY_NODE" --client-check --keys "$NUM_KEYS" \
   --gc-rounds "$GC_ROUNDS" --pool-mb "$POOL_MB" --log-block-limit "$LOG_BLOCK_LIMIT" \
-  --merge-writes "$MERGE_WRITES" --merge-ms "$MERGE_MS" --idle-ms "$IDLE_MS" "${args[@]}" &
+  --merge-writes "$MERGE_WRITES" --merge-ms "$MERGE_MS" --idle-ms "$IDLE_MS" \
+  --manager-cpu "$MANAGER_CPU" --merge-start-delay-ms "$MERGE_START_DELAY_MS" \
+  --merge-lock-delay-ms "$MERGE_LOCK_DELAY_MS" --reader-delay-ms "$READER_DELAY_MS" "${args[@]}" &
 child_pid=$!
 wait "$child_pid"
 child_pid=

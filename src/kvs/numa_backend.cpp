@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <poll.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <linux/mempolicy.h>
 #include <sched.h>
@@ -29,13 +31,16 @@ uint64_t LOG_BLOCK_HEADER_LEN = sizeof(log_block);
 #endif
 tbb::concurrent_queue<uint64_t> *reserved_alloc_queue = nullptr;
 std::list<bloomFilter *> *filterList = nullptr;
+constexpr unsigned unlimited_log_cache = 10000000; // NO_LIMIT_LOG_LENGTH in compute
 #ifndef DINOMO_NUMA_SERVER
-unsigned kLogCacheLen = 10000000;
+unsigned kLogCacheLen = unlimited_log_cache;
+#else
+extern unsigned kLogCacheLen;
 #endif
 FILE *log_fp = stderr;
 
 namespace {
-enum Command : uint64_t { Allocate = 1, Merge = 2, Quit = 3, PutMetadata = 4, GetMetadata = 5, Release = 6, Stats = 7 };
+enum Command : uint64_t { Allocate = 1, Merge = 2, Quit = 3, PutMetadata = 4, GetMetadata = 5, Release = 6, Stats = 7, AsyncMerge = 8, ReleaseEpoch = 9 };
 constexpr size_t metadata_capacity = 64 * 1024;
 struct Message {
     uint64_t command = 0, count = 0, base = 0, root = 0, ok = 1;
@@ -43,6 +48,7 @@ struct Message {
     uint64_t key_size = 0, value_size = 0, found = 0;
     char data[metadata_capacity]{};
     dinomo_numa::LogStats logs;
+    uint64_t epoch = 0;
 };
 int control = -1;
 pid_t manager = -1;
@@ -53,6 +59,18 @@ uint64_t reads = 0, writes = 0, allocations = 0;
 uint64_t metadata_reads = 0, metadata_writes = 0;
 bool reclaim_enabled = false;
 dinomo_numa::LogStats latest_log_stats;
+dinomo_numa::ConcurrentOptions concurrent_options;
+struct SharedControl {
+    pthread_rwlock_t index_lock;
+    std::atomic<uint64_t> merging{0}, writer_active{0}, read_locks{0}, reader_waits{0}, writer_waits{0};
+    std::atomic<uint64_t> writes_during_merge{0}, staged_reads_during_merge{0};
+};
+static_assert(std::atomic<uint64_t>::is_always_lock_free, "Shared counters must be lock-free");
+SharedControl *shared_control = nullptr;
+bool index_lock_initialized = false;
+bool async_pending = false, async_complete = false;
+uint64_t async_epoch = 0, async_started = 0, async_completed = 0, ipc_backpressure = 0;
+std::vector<uint64_t> current_grants, sealed_grants;
 ibv_mr local_mr{};
 ibv_qp *local_qps[1]{};
 ibv_cq *local_cqs[1]{};
@@ -79,11 +97,59 @@ void exchange_bytes(int fd, void *data, size_t size, bool sending)
     }
 }
 
+void pause_ms(uint32_t milliseconds)
+{
+    timespec remaining{milliseconds / 1000, static_cast<long>(milliseconds % 1000) * 1000000};
+    while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
+}
+
+timespec lock_deadline()
+{
+    timespec deadline{};
+    require(clock_gettime(CLOCK_REALTIME, &deadline) == 0, "Read lock clock");
+    deadline.tv_sec += 5;
+    return deadline;
+}
+
+class IndexWriteGuard {
+    bool locked = false;
+public:
+    IndexWriteGuard() {
+        if (!shared_control) return;
+        int result = pthread_rwlock_trywrlock(&shared_control->index_lock);
+        if (result == EBUSY) {
+            ++shared_control->writer_waits;
+            auto deadline = lock_deadline();
+            result = pthread_rwlock_timedwrlock(&shared_control->index_lock, &deadline);
+        }
+        require(result == 0, "Acquire index write lock (5s bound)");
+        locked = true;
+    }
+    ~IndexWriteGuard() { if (locked) pthread_rwlock_unlock(&shared_control->index_lock); }
+};
+
+void receive_merge_reply()
+{
+    Message reply;
+    exchange_bytes(control, &reply, sizeof(reply), false);
+    require(reply.ok == 1 && reply.command == AsyncMerge && reply.epoch == async_epoch,
+            "Concurrent merge failed or reply mismatched");
+    latest_log_stats = reply.logs;
+    async_pending = false;
+    async_complete = true;
+    ++async_completed;
+}
+
 Message request(Message message)
 {
+    if (async_pending) {
+        ++ipc_backpressure;
+        receive_merge_reply();
+    }
+    const auto command = message.command;
     exchange_bytes(control, &message, sizeof(message), true);
     exchange_bytes(control, &message, sizeof(message), false);
-    require(message.ok == 1, "NUMA manager rejected request");
+    require(message.ok == 1 && message.command == command, "NUMA manager rejected or mismatched request");
     latest_log_stats = message.logs;
     return message;
 }
@@ -111,7 +177,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
            bool reclaim, size_t block_limit)
 {
     try {
-        dinomo_numa::pin_cpu(cpu);
+        dinomo_numa::pin_cpu(concurrent_options.manager_cpu >= 0 ? concurrent_options.manager_cpu : cpu);
         memory_policy(node);
         require(setenv("DINOMO_NUMA_POOL_PATH", path.c_str(), 1) == 0, "setenv");
         farIdx = clht_create(1024, 1, 1, bytes);
@@ -135,6 +201,8 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
         std::map<uint64_t, Reference> references;
         std::vector<uint64_t> available;
         dinomo_numa::LogStats stats;
+        std::vector<uint64_t> merged_epoch;
+        uint64_t last_epoch = 0;
         // Volatile metadata, like the original storage metadata store. This
         // allocation follows the host-local policy restored after pool creation.
         std::map<std::string, std::string> metadata;
@@ -143,6 +211,20 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
             exchange_bytes(fd, &message, sizeof(message), false);
             if (message.command == Quit)
                 break;
+            const bool asynchronous = message.command == AsyncMerge;
+            if (asynchronous) {
+                require(shared_control && merged_epoch.empty() && message.epoch > last_epoch,
+                        "Invalid concurrent merge epoch");
+                shared_control->merging.store(1);
+                pause_ms(concurrent_options.start_delay_ms);
+            }
+            {
+            IndexWriteGuard index_writer;
+            if (asynchronous) {
+                shared_control->writer_active.store(1);
+                fprintf(stderr, "NUMA async index lock: epoch=%lu\n", message.epoch);
+                pause_ms(concurrent_options.merge_delay_ms);
+            }
             if (message.command == Allocate) {
                 require(message.count > 0 && message.count <= 64,
                         "Invalid allocation batch");
@@ -169,7 +251,7 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                     auto *block = static_cast<log_block *>(pmemobj_direct(oid));
                     // No index reference, staging reference, spare allocation,
                     // or log-chain reference may survive reuse. The manager is
-                    // the only allocator and the compute worker is synchronous.
+                    // the sole allocator and resets under the index write lock.
                     memset(block->buffer, 0, MAX_LOG_BLOCK_LEN);
                     new (&block->merged_offset) std::atomic<uint32_t>(0);
                     new (&block->offset) std::atomic<uint32_t>(0);
@@ -180,9 +262,25 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                     message.addresses[i] = reinterpret_cast<uint64_t>(block);
                     logs.push_back(oid.off);
                 }
-            } else if (message.command == Merge) {
+            } else if (message.command == Merge || asynchronous) {
+                require(asynchronous || merged_epoch.empty(), "Synchronous merge before epoch retirement");
+                std::vector<uint64_t> selected = logs;
+                if (asynchronous) {
+                    require(message.count > 0 && message.count <= 64, "Invalid sealed batch size");
+                    selected.clear();
+                    for (size_t i = 0; i < message.count; ++i) {
+                        require(message.addresses[i] >= reinterpret_cast<uint64_t>(pop), "Invalid sealed address");
+                        uint64_t offset = message.addresses[i] - reinterpret_cast<uint64_t>(pop);
+                        require(std::find(logs.begin(), logs.end(), offset) != logs.end() &&
+                                std::find(selected.begin(), selected.end(), offset) == selected.end(),
+                                "Unowned or duplicate sealed log");
+                        selected.push_back(offset);
+                    }
+                    merged_epoch = selected;
+                    last_epoch = message.epoch;
+                }
                 // Allocation order is log order for this one-worker milestone.
-                for (uint64_t offset : logs) {
+                for (uint64_t offset : selected) {
                     require(blocks.at(offset).leased && !blocks.at(offset).available,
                             "Merge encountered an unleased log");
                     auto *block = static_cast<log_block *>(
@@ -219,21 +317,43 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                     }
                     block->merged_offset.store(position);
                 }
-            } else if (message.command == Release) {
+            } else if (message.command == Release || message.command == ReleaseEpoch) {
                 require(reclaim, "Log release requires reclamation mode");
                 auto *head = static_cast<uint64_t *>(pmemobj_direct(
                     PMEMoid{pool_uuid, farIdx->log_table_addr}));
-                require(*head == 0, "Compute still publishes a log chain");
+                std::vector<uint64_t> retired = logs;
+                if (message.command == ReleaseEpoch) {
+                    require(message.epoch == last_epoch && message.count == merged_epoch.size() &&
+                            !merged_epoch.empty(), "Invalid epoch release");
+                    retired = merged_epoch;
+                    for (size_t i = 0; i < retired.size(); ++i)
+                        require(message.addresses[i] == reinterpret_cast<uint64_t>(pop) + retired[i],
+                                "Epoch release addresses mismatch");
+                    // Compute is blocked on this request; the new active chain
+                    // is stable and must not refer to a retired batch.
+                    uint64_t cursor = *head;
+                    size_t visited = 0;
+                    while (cursor) {
+                        require(++visited <= blocks.size() && blocks.count(cursor) &&
+                                std::find(retired.begin(), retired.end(), cursor) == retired.end(),
+                                "Published chain references retired epoch");
+                        cursor = static_cast<log_block *>(pmemobj_direct(PMEMoid{pool_uuid, cursor}))->next.load();
+                    }
+                } else {
+                    require(merged_epoch.empty() && *head == 0, "Compute still publishes a log chain or epoch");
+                }
                 // Release is a quiescent point: the one compute worker has
                 // cleared all local references and is blocked on this reply.
-                for (uint64_t offset : logs) {
+                for (uint64_t offset : retired) {
                     auto *block = static_cast<log_block *>(pmemobj_direct(PMEMoid{pool_uuid, offset}));
                     require(block->merged_offset.load() == block->offset.load(),
                             "Cannot release an unmerged log");
                     blocks.at(offset).leased = false;
                     block->next.store(0);
                 }
-                logs.clear();
+                for (uint64_t offset : retired)
+                    logs.erase(std::find(logs.begin(), logs.end(), offset));
+                if (message.command == ReleaseEpoch) merged_epoch.clear();
                 for (auto &entry : blocks) {
                     auto &state = entry.second;
                     if (state.live == 0 && !state.leased && !state.available) {
@@ -261,6 +381,9 @@ void serve(int fd, const std::string &path, size_t bytes, int cpu, int node,
                         memcpy(message.data, entry->second.data(), message.value_size);
                 }
             }
+            if (asynchronous) shared_control->writer_active.store(0);
+            } // IndexWriteGuard: no index mutation/reset overlaps a protected GET.
+            if (asynchronous) shared_control->merging.store(0);
             stats.live_blocks = stats.leased_blocks = stats.live_records = 0;
             stats.free_blocks = available.size();
             for (const auto &entry : blocks) {
@@ -297,11 +420,31 @@ void pin_cpu(int cpu)
 }
 
 void start(const std::string &path, size_t bytes, int cpu, int memory_node,
-           bool reclaim_logs, size_t block_limit)
+           bool reclaim_logs, size_t block_limit, const ConcurrentOptions &concurrent)
 {
     require(manager == -1, "NUMA backend already started");
+    require(!concurrent.enabled || reclaim_logs, "Concurrent merge requires reclamation");
+    require(!concurrent.enabled || kLogCacheLen == unlimited_log_cache,
+            "Concurrent merge requires log-cache-len=10000000 (no premature copy pruning)");
+    require(concurrent.start_delay_ms <= 1000 && concurrent.merge_delay_ms <= 1000 &&
+            concurrent.read_delay_ms <= 1000, "Test delays must be <= 1000 ms");
+    concurrent_options = concurrent;
     reclaim_enabled = reclaim_logs;
     pin_cpu(cpu);
+    if (concurrent.enabled) {
+        void *page = mmap(nullptr, sizeof(SharedControl), PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        require(page != MAP_FAILED, "Map process-shared index control");
+        shared_control = new (page) SharedControl;
+        pthread_rwlockattr_t attributes;
+        require(pthread_rwlockattr_init(&attributes) == 0, "Initialize index lock attributes");
+        require(pthread_rwlockattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
+                pthread_rwlockattr_setkind_np(&attributes, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP) == 0 &&
+                pthread_rwlock_init(&shared_control->index_lock, &attributes) == 0,
+                "Initialize process-shared index lock");
+        index_lock_initialized = true;
+        pthread_rwlockattr_destroy(&attributes);
+    }
     int sockets[2];
     require(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
     // Bound startup and control waits if the manager fails.
@@ -353,7 +496,8 @@ void start(const std::string &path, size_t bytes, int cpu, int memory_node,
     ib_res.rkey_pool = remote_keys;
     fprintf(stdout, "NUMA backend: compute_cpu=%d manager_cpu=%d memory_node=%d\n"
                     "storage_base=0x%lx compute_mapping=%p root_offset=0x%lx\n",
-            cpu, cpu, memory_node, remote_base, static_cast<void *>(mapping),
+            cpu, concurrent.manager_cpu >= 0 ? concurrent.manager_cpu : cpu, memory_node,
+            remote_base, static_cast<void *>(mapping),
             hello.root - remote_base);
     verify_placement(memory_node);
 }
@@ -367,8 +511,93 @@ void allocate_logs(uint64_t *addresses, size_t count)
     message = request(message);
     require(count <= 64, "Allocation batch too large");
     std::copy(message.addresses, message.addresses + count, addresses);
+    if (concurrent_options.enabled)
+        current_grants.insert(current_grants.end(), addresses, addresses + count);
     allocations += count;
 }
+
+bool concurrent_enabled() { return concurrent_options.enabled; }
+
+std::vector<uint64_t> seal_grants()
+{
+    require(concurrent_enabled() && !async_pending && !async_complete &&
+            !current_grants.empty() && current_grants.size() <= 64, "Cannot seal merge batch");
+    std::vector<uint64_t> result;
+    result.swap(current_grants);
+    return result;
+}
+
+void begin_merge(const std::vector<uint64_t> &addresses)
+{
+    require(concurrent_enabled() && !async_pending && !async_complete &&
+            !addresses.empty() && addresses.size() <= 64, "Concurrent batch already pending or invalid");
+    sealed_grants = addresses;
+    Message message;
+    message.command = AsyncMerge;
+    message.epoch = ++async_epoch;
+    message.count = addresses.size();
+    std::copy(addresses.begin(), addresses.end(), message.addresses);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    exchange_bytes(control, &message, sizeof(message), true);
+    async_pending = true;
+    ++async_started;
+}
+
+bool poll_merge(bool wait)
+{
+    if (async_pending) {
+        pollfd descriptor{control, POLLIN, 0};
+        int ready;
+        do { ready = poll(&descriptor, 1, wait ? 30000 : 0); } while (ready < 0 && errno == EINTR);
+        require(ready >= 0, "Poll concurrent merge reply");
+        if (!ready && !wait) return false;
+        require(ready > 0, "Concurrent merge exceeded reply deadline");
+        receive_merge_reply();
+    }
+    return async_complete;
+}
+
+const std::vector<uint64_t> &merging_logs() { return sealed_grants; }
+
+void release_merged_logs()
+{
+    require(async_complete && !async_pending, "Concurrent merge is not complete");
+    Message message;
+    message.command = ReleaseEpoch;
+    message.epoch = async_epoch;
+    message.count = sealed_grants.size();
+    std::copy(sealed_grants.begin(), sealed_grants.end(), message.addresses);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    (void)request(message);
+    sealed_grants.clear();
+    async_complete = false;
+}
+
+void note_write() {
+    if (shared_control && shared_control->writer_active.load()) ++shared_control->writes_during_merge;
+}
+void note_staged_read() {
+    if (shared_control && shared_control->writer_active.load()) ++shared_control->staged_reads_during_merge;
+}
+
+IndexReadGuard::IndexReadGuard()
+{
+    if (!shared_control) return;
+    int result = pthread_rwlock_tryrdlock(&shared_control->index_lock);
+    if (result == EBUSY) {
+        ++shared_control->reader_waits;
+        fprintf(stderr, "NUMA index reader wait\n");
+        auto deadline = lock_deadline();
+        result = pthread_rwlock_timedrdlock(&shared_control->index_lock, &deadline);
+    }
+    require(result == 0, "Acquire index read lock (5s bound)");
+    locked = true;
+    ++shared_control->read_locks;
+}
+IndexReadGuard::~IndexReadGuard() {
+    if (locked) pthread_rwlock_unlock(&shared_control->index_lock);
+}
+void reader_pause() { if (shared_control) pause_ms(concurrent_options.read_delay_ms); }
 
 void merge_logs()
 {
@@ -394,6 +623,7 @@ void release_logs()
     Message message;
     message.command = Release;
     (void)request(message);
+    current_grants.clear();
 }
 
 LogStats log_stats()
@@ -459,6 +689,11 @@ uint64_t allocation_count() { return allocations; }
 
 void stop()
 {
+    if (shared_control)
+        fprintf(stdout, "NUMA concurrent: started=%lu completed=%lu writes_during_merge=%lu staged_reads_during_merge=%lu read_locks=%lu reader_waits=%lu writer_waits=%lu ipc_backpressure=%lu\n",
+            async_started, async_completed, shared_control->writes_during_merge.load(),
+            shared_control->staged_reads_during_merge.load(), shared_control->read_locks.load(),
+            shared_control->reader_waits.load(), shared_control->writer_waits.load(), ipc_backpressure);
     if (mapping && mapping != MAP_FAILED)
         fprintf(stdout, "NUMA counters: shared_reads=%lu shared_writes=%lu allocated_logs=%lu metadata_gets=%lu metadata_puts=%lu\n",
                 reads, writes, allocations, metadata_reads, metadata_writes);
@@ -501,6 +736,12 @@ void stop()
     free(ib_res.ib_buf);
     free(ib_res.ib_pool);
     ib_res.ib_buf = ib_res.ib_pool = nullptr;
+    if (shared_control) {
+        if (index_lock_initialized) pthread_rwlock_destroy(&shared_control->index_lock);
+        index_lock_initialized = false;
+        munmap(shared_control, sizeof(SharedControl));
+        shared_control = nullptr;
+    }
     require(manager_ok, "NUMA manager failed");
 }
 }

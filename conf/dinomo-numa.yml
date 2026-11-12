@@ -51,5 +51,10 @@ numa:
   log-block-bytes: 4096
   reclaim-logs: true
   log-block-limit: 0 # 0 means limited only by pool capacity
-  merge-write-limit: 16 # 1 restores merge-before-ack; 0 disables this trigger
+  merge-write-limit: 16 # 1 restores merge-before-ack in synchronous mode; 0 disables trigger
   merge-interval-ms: 20 # measured from the first pending write; 0 disables timer
+  concurrent-merge: false # opt-in; synchronous deferred merge remains available
+  manager-cpu: 2
+  merge-start-delay-ms: 0 # fault-injection hooks; leave zero for ordinary runs
+  merge-lock-delay-ms: 0
+  reader-delay-ms: 0

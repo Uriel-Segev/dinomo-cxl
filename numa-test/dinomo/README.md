@@ -346,16 +346,41 @@ also passed. CPUs were restored after remote testing.
 See [DEFERRED_MERGE.md](DEFERRED_MERGE.md) for function flow, policy settings,
 test commands, counters, evidence, and the remaining concurrency limitations.
 
+## Milestone 5: concurrent sealed-log merge
+
+An opt-in mode lets the separate manager merge a sealed log batch while the
+compute worker accepts new writes and reads recent values from staging. Shared
+index reads hold a process-shared reader lock until the value is copied. An
+epoch-specific release handshake retires only the completed batch and preserves
+newer logs. Allocation credits provide bounded backpressure.
+
+~~~bash
+cd ~/dinomo-cxl
+MEMORY_NODE=0 MANAGER_CPU=4 ./numa-test/dinomo/run_concurrent_test.sh --no-offline
+MANAGER_CPU=4 ./numa-test/dinomo/run_concurrent_test.sh
+~~~
+
+Local and remote memory-only tests passed 8,296 writes and 518 asynchronous
+merges using a 16 MiB pool, with 38 fresh log objects. Reader contention,
+allocation backpressure, interruption, and manager failure were also tested.
+Remote pool CPUs were restored. The stress runner inserts a 5 ms merge delay to
+exercise overlap; ordinary configuration has no injected delays. These are
+correctness results, not performance measurements.
+
+Concurrent mode defaults to disabled, preserving the synchronous baseline.
+There is still one compute worker; shared-index reads and control/allocation
+requests can wait for the manager. See [CONCURRENT_MERGE.md](CONCURRENT_MERGE.md)
+for the protocol, configuration, commands, evidence, and limitations.
+
 ## Later milestones
 
 1. Add multiple workers with per-worker staging and IPC ownership. Define CPU
    atomic access, publication ordering, allocator ownership, and reclamation
    rules before allowing concurrent access to shared metadata. Stress repeated
    updates to the same keys and hash-bucket collisions.
-2. Introduce continuous merge with reader protection and safe reclamation
-   across overlapping operations. Current reuse is safe only at explicit
-   synchronous single-worker release points. Consider compaction of partially
-   live blocks separately.
+2. Refine the coarse index lock and allocation scheduling to reduce stalls
+   during concurrent maintenance. Consider compaction of partially live blocks
+   separately, preserving reader protection and epoch ownership.
 3. Integrate the existing benchmark client and report actual end-to-end GET
    and UPDATE throughput plus median/p99 latency. The current run_dinomo_test.sh
    still invokes the five-VM harness and must be adapted to select the new

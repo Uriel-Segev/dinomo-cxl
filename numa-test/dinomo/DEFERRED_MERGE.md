@@ -4,7 +4,9 @@ The NUMA server no longer requires one index merge for every user write.
 It publishes each record before acknowledgement and serves recent values from
 local logs until worker-controlled merge updates P-CLHT. Merge and reclamation
 still execute synchronously; there is no new background thread or overlapping
-reader/writer execution.
+reader/writer execution in this baseline mode. The later opt-in
+[concurrent mode](CONCURRENT_MERGE.md) adds protected index reads and sealed
+epochs; synchronous deferred merge remains the default.
 
 ## Write, read, and release flow
 
@@ -121,6 +123,6 @@ runner, not an automatically created commit.
 These results establish visibility and safe reuse under worker-controlled
 deferred merge. They do not establish a performance improvement, durability,
 recovery, concurrent maintenance, or multiple-worker correctness. The tmpfs
-pool remains volatile. Future background merge requires reader protection and
-a revised ownership/publication protocol; it cannot simply run these methods
-on another thread.
+pool remains volatile. The later [concurrent milestone](CONCURRENT_MERGE.md)
+adds reader protection and a revised ownership/publication protocol; it does
+not simply run these synchronous methods on another thread.

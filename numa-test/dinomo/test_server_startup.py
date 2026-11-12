@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise NUMA lifecycle and optional client correctness; CPU hotplug is external."""
 import argparse
+import json
+import os
 import re
 from pathlib import Path
 import signal
@@ -37,6 +39,13 @@ def main():
     parser.add_argument("--merge-ms", type=int, default=20)
     parser.add_argument("--idle-ms", type=int, default=0)
     parser.add_argument("--require-deferred", action="store_true")
+    parser.add_argument("--concurrent", action="store_true")
+    parser.add_argument("--manager-cpu", type=int)
+    parser.add_argument("--merge-start-delay-ms", type=int, default=0)
+    parser.add_argument("--merge-lock-delay-ms", type=int, default=0)
+    parser.add_argument("--reader-delay-ms", type=int, default=0)
+    parser.add_argument("--require-overlap", action="store_true")
+    parser.add_argument("--require-backpressure", action="store_true")
     args = parser.parse_args()
     if args.expect_exhaustion and not (args.client_check and args.no_reclaim and args.gc_rounds and args.log_block_limit == 0):
         parser.error("Expected exhaustion requires a GC workload, --no-reclaim, and no block limit")
@@ -48,6 +57,17 @@ def main():
         parser.error("Deterministic deferred checks require >=16 writes, timer disabled, >=4 keys")
     if args.idle_ms and (args.merge_writes != 0 or args.merge_ms <= 0 or args.idle_ms <= args.merge_ms):
         parser.error("Idle probe requires timer-only merge and an idle interval longer than the timer")
+    if args.concurrent and (args.no_reclaim or not 1 <= args.merge_writes <= 16 or args.idle_ms):
+        parser.error("Concurrent mode requires reclamation and a 1..16 write limit")
+    if args.require_overlap and not (args.concurrent and args.merge_lock_delay_ms > 0):
+        parser.error("Overlap evidence requires concurrent mode and a positive merge-lock test delay")
+    if args.require_backpressure and not args.concurrent:
+        parser.error("Backpressure evidence requires concurrent mode")
+    if any(not 0 <= value <= 1000 for value in (args.merge_start_delay_ms, args.merge_lock_delay_ms, args.reader_delay_ms)):
+        parser.error("Test delays must be 0..1000 ms")
+    manager_cpu = args.host_cpu if args.manager_cpu is None else args.manager_cpu
+    if not any((node / f"cpu{manager_cpu}").exists() for node in Path("/sys/devices/system/node").glob("node[0-9]*") if (node / f"cpu{args.host_cpu}").exists()):
+        parser.error("Manager CPU must belong to the host CPU's NUMA node")
     root = Path(__file__).resolve().parents[2]
     build = (root / args.build_dir).resolve()
     server_binary = build / "target/kvs/dinomo-kvs-numa"
@@ -75,6 +95,11 @@ def main():
     if args.no_reclaim: config = config.replace("reclaim-logs: true", "reclaim-logs: false")
     config = config.replace("merge-write-limit: 16", f"merge-write-limit: {args.merge_writes}")
     config = config.replace("merge-interval-ms: 20", f"merge-interval-ms: {args.merge_ms}")
+    config = config.replace("manager-cpu: 2", f"manager-cpu: {manager_cpu}")
+    if args.concurrent: config = config.replace("concurrent-merge: false", "concurrent-merge: true")
+    config = config.replace("merge-start-delay-ms: 0", f"merge-start-delay-ms: {args.merge_start_delay_ms}")
+    config = config.replace("merge-lock-delay-ms: 0", f"merge-lock-delay-ms: {args.merge_lock_delay_ms}")
+    config = config.replace("reader-delay-ms: 0", f"reader-delay-ms: {args.reader_delay_ms}")
     # Keep private pool directories under an owned evidence subdirectory, so
     # cleanup can be verified without inspecting another user's resources.
     pool_root = Path(tempfile.mkdtemp(prefix="dinomo-startup-", dir="/dev/shm"))
@@ -133,6 +158,13 @@ def main():
             children = Path(f"/proc/{server.pid}/task/{server.pid}/children").read_text().split()
             if len(children) != 1:
                 raise RuntimeError(f"Expected one manager child, found {children}")
+            server_affinity = sorted(os.sched_getaffinity(server.pid))
+            manager_affinity = sorted(os.sched_getaffinity(int(children[0])))
+            if server_affinity != [args.host_cpu] or manager_affinity != [manager_cpu]:
+                raise RuntimeError("Unexpected server/manager CPU affinity")
+            (evidence / "processes.json").write_text(json.dumps({
+                "server": server.pid, "manager": int(children[0]), "router": route.pid,
+                "server_cpus": server_affinity, "manager_cpus": manager_affinity}, indent=2))
             if args.client_check:
                 client_directory = evidence / "client"
                 client_directory.mkdir()
@@ -182,8 +214,21 @@ def main():
                 raise RuntimeError("Missing index-read evidence")
             if args.require_deferred and (not staged or not thresholds or timers or thresholds >= writes or (writes % args.merge_writes and not shutdowns)):
                 raise RuntimeError("Deferred reads/threshold/shutdown merge checks failed")
-            if args.merge_writes == 1 and args.merge_ms == 0 and (thresholds != writes or timers or shutdowns or staged):
+            if not args.concurrent and args.merge_writes == 1 and args.merge_ms == 0 and (thresholds != writes or timers or shutdowns or staged):
                 raise RuntimeError("Merge-before-ack control did not merge each write")
+            if args.concurrent:
+                concurrent = re.search(r"NUMA concurrent: started=(\d+) completed=(\d+) writes_during_merge=(\d+) staged_reads_during_merge=(\d+) read_locks=(\d+) reader_waits=(\d+) writer_waits=(\d+) ipc_backpressure=(\d+)", server_text)
+                if not concurrent:
+                    raise RuntimeError("Missing concurrent-merge evidence")
+                started, completed, overlap_writes, overlap_reads, locks, reader_waits, writer_waits, backpressure = map(int, concurrent.groups())
+                if not started or completed != started or not locks:
+                    raise RuntimeError("Merge epochs did not drain or index readers were unprotected")
+                if args.require_overlap and (not overlap_writes or not overlap_reads):
+                    raise RuntimeError("No write/staging-read progress while manager held the index write lock")
+                if args.reader_delay_ms and not writer_waits:
+                    raise RuntimeError("Pinned reader did not force manager to wait")
+                if args.require_backpressure and not backpressure:
+                    raise RuntimeError("Allocation/control backpressure was not exercised")
             if args.idle_ms and not timers:
                 raise RuntimeError("Idle timer did not merge pending writes")
             if args.idle_ms:

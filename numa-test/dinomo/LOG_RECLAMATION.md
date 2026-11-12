@@ -5,8 +5,10 @@ single-worker merge/release and the existing DINOMO compute/P-CLHT code.
 The server now also supports acknowledgements before merge; see
 [DEFERRED_MERGE.md](DEFERRED_MERGE.md). Pending records remain leased until a
 complete merge and release, so the ownership rule below is unchanged.
-It does not add background merge,
+This baseline does not add background merge,
 multiple workers, compaction, deletion, replication, or crash recovery.
+The later [concurrent mode](CONCURRENT_MERGE.md) adds reader protection and
+epoch-specific release while preserving the zero-reference, unleased reuse rule.
 
 ## Ownership rule
 
@@ -56,7 +58,9 @@ finished copying its result before another write can merge/release, and there
 is no simultaneous index reader during merge. CLHT GET refreshes the active
 table from the root; compute does not retain old table snapshots between
 operations. This protocol cannot be reused for concurrent workers or
-background merge without reader protection and a new ownership protocol.
+background merge without reader protection and a new ownership protocol. The
+later concurrent mode supplies those for one compute worker: it can release a
+completed epoch while a newer shared log head remains active.
 
 ## Memory bounds and counters
 

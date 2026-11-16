@@ -68,6 +68,7 @@ struct SharedControl {
     pthread_rwlock_t index_lock;
     std::atomic<uint64_t> merging{0}, writer_active{0}, read_locks{0}, reader_waits{0}, writer_waits{0};
     std::atomic<uint64_t> writes_during_merge{0}, staged_reads_during_merge{0};
+    std::atomic<uint64_t> reader_wait_ns{0}, writer_wait_ns{0};
 };
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "Shared counters must be lock-free");
 SharedControl *shared_control = nullptr;
@@ -75,6 +76,7 @@ bool index_lock_initialized = false;
 thread_local bool async_pending = false, async_complete = false;
 thread_local uint64_t async_epoch = 0;
 std::atomic<uint64_t> async_started{0}, async_completed{0}, ipc_backpressure{0};
+std::atomic<uint64_t> allocation_rpc_ns{0}, merge_wait_ns{0};
 thread_local std::vector<uint64_t> current_grants, sealed_grants;
 ibv_mr local_mr{};
 ibv_qp *local_qps[max_workers]{};
@@ -116,6 +118,26 @@ timespec lock_deadline()
     return deadline;
 }
 
+uint64_t stall_clock() noexcept
+{
+    if (!concurrent_options.measure_stalls) return 0;
+    timespec now{};
+    // Timing must never throw while a guard is unwinding an IPC/lock error.
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+}
+
+class StallTimer {
+    std::atomic<uint64_t> &total;
+    uint64_t start;
+public:
+    explicit StallTimer(std::atomic<uint64_t> &counter) : total(counter), start(stall_clock()) {}
+    ~StallTimer() {
+        const auto end = start ? stall_clock() : 0;
+        if (end >= start && start) total.fetch_add(end - start, std::memory_order_relaxed);
+    }
+};
+
 class IndexWriteGuard {
     bool locked = false;
 public:
@@ -123,6 +145,7 @@ public:
         if (!shared_control) return;
         int result = pthread_rwlock_trywrlock(&shared_control->index_lock);
         if (result == EBUSY) {
+            StallTimer timing(shared_control->writer_wait_ns);
             ++shared_control->writer_waits;
             auto deadline = lock_deadline();
             result = pthread_rwlock_timedwrlock(&shared_control->index_lock, &deadline);
@@ -135,6 +158,7 @@ public:
 
 void receive_merge_reply()
 {
+    StallTimer timing(merge_wait_ns);
     Message reply;
     exchange_bytes(control, &reply, sizeof(reply), false);
     require(reply.ok == 1 && reply.command == AsyncMerge && reply.epoch == async_epoch && reply.worker == worker_id,
@@ -557,6 +581,7 @@ void bind_worker(size_t id)
 
 void allocate_logs(uint64_t *addresses, size_t count)
 {
+    StallTimer timing(allocation_rpc_ns);
     require(count > 0 && count <= 64, "Allocation batch must be between 1 and 64");
     Message message;
     message.command = Allocate;
@@ -600,9 +625,13 @@ void begin_merge(const std::vector<uint64_t> &addresses)
 bool poll_merge(bool wait)
 {
     if (async_pending) {
+        const auto wait_start = wait ? stall_clock() : 0;
         pollfd descriptor{control, POLLIN, 0};
         int ready;
         do { ready = poll(&descriptor, 1, wait ? 30000 : 0); } while (ready < 0 && errno == EINTR);
+        const auto wait_end = wait_start ? stall_clock() : 0;
+        if (wait_start && wait_end >= wait_start)
+            merge_wait_ns.fetch_add(wait_end - wait_start, std::memory_order_relaxed);
         require(ready >= 0, "Poll concurrent merge reply");
         if (!ready && !wait) return false;
         require(ready > 0, "Concurrent merge exceeded reply deadline");
@@ -639,8 +668,9 @@ IndexReadGuard::IndexReadGuard()
     if (!shared_control) return;
     int result = pthread_rwlock_tryrdlock(&shared_control->index_lock);
     if (result == EBUSY) {
+        StallTimer timing(shared_control->reader_wait_ns);
         ++shared_control->reader_waits;
-        fprintf(stderr, "NUMA index reader wait\n");
+        if (!concurrent_options.measure_stalls) fprintf(stderr, "NUMA index reader wait\n");
         auto deadline = lock_deadline();
         result = pthread_rwlock_timedrdlock(&shared_control->index_lock, &deadline);
     }
@@ -655,6 +685,7 @@ void reader_pause() { if (shared_control) pause_ms(concurrent_options.read_delay
 
 void merge_logs()
 {
+    StallTimer timing(merge_wait_ns);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #ifdef DINOMO_NUMA_SERVER
     timespec instant{};
@@ -748,6 +779,10 @@ void stop()
         bind_worker(0);
         try { latest_log_stats = log_stats(); } catch (const std::exception &) {}
     }
+    if (concurrent_options.measure_stalls)
+        fprintf(stdout, "NUMA stalls: allocation_rpc_ns=%lu merge_wait_ns=%lu reader_wait_ns=%lu writer_wait_ns=%lu\n",
+            allocation_rpc_ns.load(), merge_wait_ns.load(), shared_control ? shared_control->reader_wait_ns.load() : 0UL,
+            shared_control ? shared_control->writer_wait_ns.load() : 0UL);
     if (shared_control)
         fprintf(stdout, "NUMA concurrent: started=%lu completed=%lu writes_during_merge=%lu staged_reads_during_merge=%lu read_locks=%lu reader_waits=%lu writer_waits=%lu ipc_backpressure=%lu\n",
             async_started.load(), async_completed.load(), shared_control->writes_during_merge.load(),

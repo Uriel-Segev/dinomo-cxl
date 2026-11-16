@@ -18,6 +18,7 @@ struct LogStats {
 };
 struct ConcurrentOptions {
     bool enabled = false;
+    bool measure_stalls = false;
     int manager_cpu = -1;
     uint32_t start_delay_ms = 0, merge_delay_ms = 0, read_delay_ms = 0;
 };

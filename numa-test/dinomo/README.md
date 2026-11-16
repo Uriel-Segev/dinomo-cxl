@@ -111,6 +111,12 @@ No performance improvement is established by the correctness stress results.
 Dynamic reassignment, replication, recovery, durability, and actual CXL
 hardware evaluation remain separate work.
 
+A NUMA-only `dinomo-numa-bench` client scaffold now provides bounded LOAD,
+READ, and UPDATE operations, synchronized starts, checked responses, and
+per-client latency histograms. [BENCHMARK_CLIENT.md](BENCHMARK_CLIENT.md)
+describes its smoke test and optional backend timing. The benchmark launcher
+and aggregate reporting are still pending; this does not establish performance.
+
 For a new chat, ask the agent to read this resume section and MULTIWORKER.md,
 inspect `git status`, and continue with benchmark integration. The sections
 below preserve the earlier single-worker milestones and their test procedures.

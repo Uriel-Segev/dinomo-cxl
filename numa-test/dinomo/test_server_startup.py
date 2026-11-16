@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--idle-ms", type=int, default=0)
     parser.add_argument("--require-deferred", action="store_true")
     parser.add_argument("--concurrent", action="store_true")
+    parser.add_argument("--measure-stalls", action="store_true", help="Check optional backend elapsed-time counters")
     parser.add_argument("--manager-cpu", type=int)
     parser.add_argument("--merge-start-delay-ms", type=int, default=0)
     parser.add_argument("--merge-lock-delay-ms", type=int, default=0)
@@ -99,6 +100,7 @@ def main():
     config = (root / "conf/dinomo-numa.yml").read_text()
     config = config.replace("  memory: 1", f"  memory: {args.workers}", 1)
     config += "\n  worker-cpus: [" + ", ".join(map(str, worker_cpus)) + "]\n"
+    if args.measure_stalls: config += "  measure-stalls: true\n"
     config = config.replace("host-cpu: 2", f"host-cpu: {args.host_cpu}")
     config = config.replace("memory-node: 1", f"memory-node: {args.memory_node}")
     config = config.replace("storage-cap: 256", f"storage-cap: {args.pool_mb}")
@@ -263,6 +265,12 @@ def main():
                     raise RuntimeError("Pinned reader did not force manager to wait")
                 if args.require_backpressure and not backpressure:
                     raise RuntimeError("Allocation/control backpressure was not exercised")
+            if args.measure_stalls:
+                timing = re.search(r"NUMA stalls: allocation_rpc_ns=(\d+) merge_wait_ns=(\d+) reader_wait_ns=(\d+) writer_wait_ns=(\d+)", server_text)
+                if not timing or not int(timing[1]) or not int(timing[2]):
+                    raise RuntimeError("Missing allocation/merge elapsed-time counters")
+                if args.require_overlap and args.reader_delay_ms and (not int(timing[3]) or not int(timing[4])):
+                    raise RuntimeError("Expected contended reader/writer elapsed time")
             if args.idle_ms and not timers:
                 raise RuntimeError("Idle timer did not merge pending writes")
             if args.idle_ms:

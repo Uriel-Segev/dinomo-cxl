@@ -1592,6 +1592,7 @@ int main(int argc, char *argv[])
     if (!numa_merge_writes && !numa_merge_ms)
         throw std::runtime_error("NUMA merge needs a write limit or a timer");
     dinomo_numa::ConcurrentOptions concurrency;
+    concurrency.measure_stalls = numa["measure-stalls"] ? numa["measure-stalls"].as<bool>() : false;
     concurrency.enabled = numa["concurrent-merge"] ? numa["concurrent-merge"].as<bool>() : false;
     concurrency.manager_cpu = numa["manager-cpu"] ? numa["manager-cpu"].as<int>() : -1;
     concurrency.start_delay_ms = numa["merge-start-delay-ms"] ? numa["merge-start-delay-ms"].as<unsigned>() : 0;

@@ -118,8 +118,8 @@ def main():
             if mode != "LOAD":
                 if not data["completed"] or data["issued"] != data["completed"] + data["drain_completed"]:
                     raise RuntimeError("Invalid measurement/drain counts")
-                if sum(count for _, count in data["latency_histogram_us"]) != data["completed"]:
-                    raise RuntimeError("Latency histogram does not match completions")
+                if sum(count for _, count in data["latency_histogram_us"]) != data["issued"]:
+                    raise RuntimeError("Latency histogram does not match issued/drained requests")
 
     try:
         router = launch(["taskset", "-c", str(args.manager_cpu), str(route_bin)], route_dir, evidence / "routing.log")

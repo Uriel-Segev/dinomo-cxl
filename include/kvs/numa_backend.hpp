@@ -19,6 +19,7 @@ struct LogStats {
 struct ConcurrentOptions {
     bool enabled = false;
     bool measure_stalls = false;
+    bool quiet = false;
     int manager_cpu = -1;
     uint32_t start_delay_ms = 0, merge_delay_ms = 0, read_delay_ms = 0;
 };
@@ -28,6 +29,7 @@ void start(const std::string &path, std::size_t bytes, int cpu, int memory_node,
 // Bind each compute thread before using its buffers, grants, or manager channel.
 void bind_worker(std::size_t id);
 bool concurrent_enabled();
+bool diagnostics_enabled();
 std::vector<uint64_t> seal_grants();
 void begin_merge(const std::vector<uint64_t> &addresses);
 bool poll_merge(bool wait = false);

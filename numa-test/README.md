@@ -1,8 +1,10 @@
 # NUMA memory-pool latency experiment
 
-For the first functional DINOMO shared-memory implementation, see
-[dinomo/README.md](dinomo/README.md). Its runner tests the existing DINOMO
-compute methods and PMDK CLHT against a node 1 pool with node 1 CPUs offline.
+For the cumulative setup, implementation overview, correctness/comparison
+tests, and host-native benchmarks, start with
+[the DINOMO NUMA guide](dinomo/README.md). This page describes the smaller
+memory experiments; their CPU-offline workflow is separate from ordinary
+DINOMO tests and benchmarks, which can leave every CPU online.
 
 This experiment models the planned single-server DINOMO layout:
 
@@ -174,9 +176,10 @@ deployment running, execute:
 
 This performs LOAD followed by write-only, read-only, and 50/50 mixed
 workloads. It saves both the raw log and a parsed CSV under results/.
-Currently it tests whichever transport is selected by the DINOMO deployment in
-vm-configs/c6525-25g/config.sh. After DINOMO is changed to use the NUMA memory
-pool, the same test will report the new end-to-end operation latency.
+This is the legacy five-VM/Soft-RoCE workflow selected by
+`vm-configs/c6525-25g/config.sh`. For the implemented host-native NUMA
+LOAD/READ/UPDATE/VERIFY workflow, use
+[dinomo/run_benchmark.py as documented here](dinomo/BENCHMARKING.md).
 
 Run the original latency experiment and every extended memory test in sequence:
 

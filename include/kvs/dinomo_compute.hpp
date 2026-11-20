@@ -935,10 +935,16 @@ retry:
          * block address is zero (no current block is allocated for this thread). The original
          * code had no diagnostic print here. This is the path that triggers a new log block
          * allocation from storage — the print shows which thread and key caused it. */
+#ifdef DINOMO_NUMA_MILESTONE
+        if (dinomo_numa::diagnostics_enabled())
+#endif
         fprintf(stderr, "[DBG put] thread=%ld key=%lu non_replicated_alloc=0, calling preallocate_log_blocks\n", thread_id, key);
         preallocate_log_blocks(lkey_buf, qp, buf_ptr, cq, wc, num_wc);
         /* ADDED: print after preallocate_log_blocks() returns to confirm the blocking SEND/RECV
          * round-trip to storage completed. The original code had no diagnostic print here. */
+#ifdef DINOMO_NUMA_MILESTONE
+        if (dinomo_numa::diagnostics_enabled())
+#endif
         fprintf(stderr, "[DBG put] thread=%ld key=%lu preallocate_log_blocks returned\n", thread_id, key);
 
         next_batch = pop_log_blocks_raddr();
@@ -946,6 +952,9 @@ retry:
         /* ADDED: print the remote address of the newly allocated log block. next_batch is the
          * RDMA address in the storage pool where this thread will write its log entries.
          * The original code had no diagnostic print here. */
+#ifdef DINOMO_NUMA_MILESTONE
+        if (dinomo_numa::diagnostics_enabled())
+#endif
         fprintf(stderr, "[DBG put] thread=%ld key=%lu next_batch=0x%lx\n", thread_id, key, next_batch);
 
         // Allocate new local log block
@@ -1437,10 +1446,16 @@ retry:
          * block address is zero (no current block is allocated for this thread). The original
          * code had no diagnostic print here. This is the path that triggers a new log block
          * allocation from storage — the print shows which thread and key caused it. */
+#ifdef DINOMO_NUMA_MILESTONE
+        if (dinomo_numa::diagnostics_enabled())
+#endif
         fprintf(stderr, "[DBG put] thread=%ld key=%lu non_replicated_alloc=0, calling preallocate_log_blocks\n", thread_id, key);
         preallocate_log_blocks(lkey_buf, qp, buf_ptr, cq, wc, num_wc);
         /* ADDED: print after preallocate_log_blocks() returns to confirm the blocking SEND/RECV
          * round-trip to storage completed. The original code had no diagnostic print here. */
+#ifdef DINOMO_NUMA_MILESTONE
+        if (dinomo_numa::diagnostics_enabled())
+#endif
         fprintf(stderr, "[DBG put] thread=%ld key=%lu preallocate_log_blocks returned\n", thread_id, key);
 
         next_batch = pop_log_blocks_raddr();
@@ -1448,6 +1463,9 @@ retry:
         /* ADDED: print the remote address of the newly allocated log block. next_batch is the
          * RDMA address in the storage pool where this thread will write its log entries.
          * The original code had no diagnostic print here. */
+#ifdef DINOMO_NUMA_MILESTONE
+        if (dinomo_numa::diagnostics_enabled())
+#endif
         fprintf(stderr, "[DBG put] thread=%ld key=%lu next_batch=0x%lx\n", thread_id, key, next_batch);
 
         // Allocate new local log block

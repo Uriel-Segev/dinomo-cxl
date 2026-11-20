@@ -3,8 +3,8 @@
 `dinomo-numa-bench` is a host-native client using the existing `KvsClient`
 network API. It is built only with `BUILD_NUMA_SERVER=ON`. The original
 `dinomo-bench`, trigger executable, and five-VM Soft-RoCE scripts are unchanged.
-The host-native benchmark launcher and aggregate result reporting remain to
-be implemented; the smoke test below validates the client, not performance.
+The host-native launcher and aggregate reports are described in
+[BENCHMARKING.md](BENCHMARKING.md). The smoke test below validates the client.
 
 ## Build and verify
 
@@ -37,7 +37,7 @@ The executable takes one YAML configuration path. In addition to
 
 | Field | Meaning |
 |---|---|
-| mode | LOAD, READ, or UPDATE |
+| mode | LOAD, VERIFY, READ, or UPDATE |
 | keys / value-size | Positive integer key count and application bytes per value (maximum 3000) |
 | clients / client-id | 1..64 clients and a zero-based ID; clients cannot exceed keys |
 | outstanding | Maximum requests in flight per client |
@@ -54,6 +54,7 @@ files. A launcher must atomically publish a future Linux monotonic timestamp
 in nanoseconds in the start file, after every client is ready. Each phase needs
 fresh directories and barrier/result paths. See `test_benchmark_client.py` for
 a concrete configuration and synchronization example.
+VERIFY only reads and checks the client's complete partition; it does not write.
 
 READ/UPDATE sample the complete loaded keyspace uniformly. Values are identical
 `a` bytes, matching the legacy synthetic workload; this tests response/value
@@ -62,10 +63,13 @@ correctness client tests generation visibility separately.
 
 The measured window ends at the shared scheduled deadline. Throughput uses
 successful responses observed within that window; later responses are counted
-only as drain completions. All issued requests must complete successfully.
+separately as drain completions. All issued requests must complete successfully.
 Latency spans API issue to response observation using a monotonic clock,
 including routing, transport and server waits. The JSON histogram rounds each
-latency upward to a whole microsecond and includes only measured completions.
+latency upward to a whole microsecond and includes all requests issued within
+the timed window, including those completed during drain. This retains the
+slowest boundary requests in latency reporting. Result JSON includes the
+scheduled start/end, observed start, CPU, and configuration identity.
 Merge histograms across clients to calculate combined median/p99 values;
 averaging per-client percentiles is incorrect. Histogram work and value checks
 consume client CPU, so client concurrency and placement need measurement.
@@ -75,6 +79,9 @@ consume client CPU, so client concurrency and placement need measurement.
 Set `numa.measure-stalls: true` in the server configuration to emit cumulative
 `NUMA stalls` counters at shutdown. The default is false. With timing enabled,
 per-contention reader messages are suppressed to avoid logging each wait.
+The benchmark template also sets `numa.quiet: true` to suppress allocation and
+merge diagnostics independently of timing. The default for other runs is false;
+startup, placement, errors, and shutdown summaries remain available.
 
 - `allocation_rpc_ns`: elapsed allocation-call time, including IPC, manager
   scheduling, and any pending-merge reply consumed before allocation.
@@ -119,6 +126,6 @@ Soft-RoCE deployment. Nine invalid benchmark configurations were rejected.
 | Existing injected-contention test with timing enabled | Passed; one reader wait and one writer wait, both with positive elapsed times | `server-startup-5smy76z6` |
 
 All runs kept CPUs online. The evidence is machine-local and ignored by Git.
-No throughput or scaling claim follows from these verification runs. Existing
-allocation/merge diagnostic logging still needs attention before performance
-measurements, alongside the pending launcher and aggregate report.
+No throughput or scaling claim follows from these verification runs. These
+initial client checks predate the complete launcher; current launcher and
+accounting checks are described in BENCHMARKING.md.

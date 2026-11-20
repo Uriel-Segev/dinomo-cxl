@@ -277,7 +277,7 @@ void serve(const std::vector<int> &fds, const std::string &path, size_t bytes, i
             IndexWriteGuard index_writer;
             if (asynchronous) {
                 shared_control->writer_active.store(1);
-                fprintf(stderr, "NUMA async index lock: epoch=%lu\n", message.epoch);
+                if (!concurrent_options.quiet) fprintf(stderr, "NUMA async index lock: epoch=%lu\n", message.epoch);
                 pause_ms(concurrent_options.merge_delay_ms);
             }
             if (message.command == Allocate) {
@@ -595,6 +595,7 @@ void allocate_logs(uint64_t *addresses, size_t count)
 }
 
 bool concurrent_enabled() { return concurrent_options.enabled; }
+bool diagnostics_enabled() { return !concurrent_options.quiet; }
 
 std::vector<uint64_t> seal_grants()
 {
@@ -670,7 +671,7 @@ IndexReadGuard::IndexReadGuard()
     if (result == EBUSY) {
         StallTimer timing(shared_control->reader_wait_ns);
         ++shared_control->reader_waits;
-        if (!concurrent_options.measure_stalls) fprintf(stderr, "NUMA index reader wait\n");
+        if (!concurrent_options.measure_stalls && !concurrent_options.quiet) fprintf(stderr, "NUMA index reader wait\n");
         auto deadline = lock_deadline();
         result = pthread_rwlock_timedrdlock(&shared_control->index_lock, &deadline);
     }
@@ -688,10 +689,12 @@ void merge_logs()
     StallTimer timing(merge_wait_ns);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #ifdef DINOMO_NUMA_SERVER
+    if (!concurrent_options.quiet) {
     timespec instant{};
     require(clock_gettime(CLOCK_MONOTONIC, &instant) == 0, "Read merge clock");
     fprintf(stdout, "NUMA merge request: monotonic_ns=%lld\n",
             static_cast<long long>(instant.tv_sec) * 1000000000LL + instant.tv_nsec);
+    }
 #endif
     Message message;
     message.command = Merge;

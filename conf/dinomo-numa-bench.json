@@ -1,0 +1,76 @@
+{
+  "storage": "./",
+  "capacities": {
+    "memory-cap": 16,
+    "storage-cap": 512
+  },
+  "threads": {
+    "memory": 1,
+    "storage": 0,
+    "routing": 1,
+    "benchmark": 1
+  },
+  "kvs_config": {
+    "value-size": 64,
+    "shortcut-size": 16,
+    "log-cache-len": 10000000,
+    "log-block-prealloc-num": 2
+  },
+  "replication": {
+    "memory": 1,
+    "storage": 0,
+    "minimum": 1,
+    "local": 1
+  },
+  "policy": {
+    "elasticity": false,
+    "selective-rep": false,
+    "tiering": false,
+    "batching": false,
+    "batchingthreshold": 5000,
+    "caching": false,
+    "adaptive-caching": false,
+    "weight-or-vratio": 0.5,
+    "perf-monitoring": false,
+    "server-report-period": 15,
+    "server-key-monitor-period": 60
+  },
+  "net_config": {
+    "request_puller_hwm": 1000,
+    "request_puller_backlog": 100
+  },
+  "server": {
+    "public_ip": "127.0.0.1",
+    "private_ip": "127.0.0.1",
+    "seed_ip": "127.0.0.1",
+    "mgmt_ip": "NULL",
+    "routing": [
+      "127.0.0.1"
+    ],
+    "monitoring": []
+  },
+  "routing": {
+    "ip": "127.0.0.1",
+    "monitoring": []
+  },
+  "numa": {
+    "host-cpu": 2,
+    "memory-node": 0,
+    "pool-directory": "/dev/shm",
+    "log-block-bytes": 16384,
+    "reclaim-logs": true,
+    "log-block-limit": 0,
+    "merge-write-limit": 16,
+    "merge-interval-ms": 20,
+    "concurrent-merge": true,
+    "manager-cpu": 4,
+    "worker-cpus": [
+      2
+    ],
+    "merge-start-delay-ms": 0,
+    "merge-lock-delay-ms": 0,
+    "reader-delay-ms": 0,
+    "quiet": true,
+    "measure-stalls": true
+  }
+}

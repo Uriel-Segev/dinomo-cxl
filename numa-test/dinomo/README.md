@@ -1,524 +1,402 @@
-# DINOMO NUMA-backed deployment and milestones
+# DINOMO NUMA experiment: setup, implementation, tests, and benchmarks
 
-## Resume on a new CloudLab node or in a new chat
+This is the starting guide for the NUMA work in this repository. It covers the
+small memory experiments, the DINOMO implementation milestones, correctness
+and comparison tests, and the host-native benchmark workflow. Commands run
+from the **repository root** unless a command explicitly changes directory.
 
-This is the starting point for branch `numa-merge-gc`. The implementation uses
-DINOMO routing, KVS workers, operation logs, and P-CLHT, with a NUMA-specific
-manager and shared-memory backend replacing the RDMA storage path. Multiple
-compute workers are threads in one KVS process, sharing one pool and manager.
-Two-worker local/remote pool and four-worker local pool tests passed, including
-small-pool reuse; multiworker contention and failure cleanup also passed.
+## What is implemented
 
-Read [MULTIWORKER.md](MULTIWORKER.md) for current restrictions and recorded
-results. [NETWORK_INTEGRATION_AUDIT.md](NETWORK_INTEGRATION_AUDIT.md) includes
-historical findings; its initial audit is not an outstanding implementation
-checklist. [CONCURRENT_MERGE.md](CONCURRENT_MERGE.md) explains the original
-single-worker merge/reader protection protocol.
+DINOMO can run on one Linux host with its existing network client, router,
+compute engine, operation logs, and P-CLHT index. A NUMA backend replaces the
+RDMA storage path with a shared-memory pool and a separate manager process.
+No VM or Soft-RoCE device is needed for this workflow.
 
-### Fresh-node setup
+| Component | Current behavior |
+|---|---|
+| Network path | Existing `KvsClient` → DINOMO router → KVS compute worker |
+| Compute | One or multiple worker threads in one KVS process, with private staging and fixed key ownership |
+| Pool | Private, volatile, tmpfs-backed PMDK pool placed on a selected NUMA memory node |
+| Data access | Checked address-to-offset translation and copies between the compute mapping and shared pool; different mapping addresses are supported |
+| Manager | Separate process owning allocation, merge, index updates, metadata IPC, and log reuse |
+| Index | Existing P-CLHT implementation; concurrent mode protects index lookup through value copying with a process-shared reader lock |
+| Visibility | Writes publish before acknowledgement; the owning worker reads the latest unmerged value from active staging or retained log copies |
+| Merge | Write-threshold/timer triggers; synchronous deferred mode or opt-in concurrent sealed-log epochs |
+| Reclamation | Reuse only after a block has zero index references and its compute lease has been explicitly released |
+| Shutdown | Drain pending writes/epochs, release grants, stop the manager, and remove the private pool |
+| Benchmarking | LOAD, READ, UPDATE, VERIFY; synchronized clients; combined latency histograms; JSON/CSV reports and cleanup evidence |
 
-1. Commit and push the work before leaving the old node, then clone your fork
-   and check out `numa-merge-gc` on the new node. Use the saved commit ID to
-   identify the exact baseline; local uncommitted files do not transfer.
-2. Use an x86-64 Linux host with two memory-bearing NUMA nodes for the remote
-   comparison. Inspect topology before choosing CPUs or memory nodes:
+Concurrent mode lets the manager merge a sealed epoch while workers continue
+using private staging. The manager still handles commands serially, and index
+reads and allocation/control requests can wait. Each worker can have one
+outstanding sealed epoch. A cold/live record keeps its block allocated; there
+is no compaction of partially live blocks.
 
-   ```bash
-   lscpu -e=CPU,NODE,ONLINE
-   numactl --hardware
-   bash numa-test/numa_cpu_control.sh status
-   df -h /dev/shm
-   ```
+The supported configuration keeps membership and worker count fixed, uses
+canonical positive decimal integer user keys, and disables caches, batching,
+elasticity, and replicated copies. Multiple workers require concurrent merge.
+The implementation accepts up to 64 workers, but the exercised configurations
+are 1, 2, and 4 workers. There is no dynamic reassignment, worker failover,
+restart recovery, or durability guarantee. Remote NUMA is an experimental
+memory-placement model, not actual CXL hardware or CXL timing.
 
-   Earlier runs used a c8220 with compute CPUs 2,6,8,10 and manager CPU 4 on
-   node 0. These IDs are examples, not portable defaults. Pick online compute
-   and manager CPUs on the same node; put the pool on that node for the local
-   control and another memory-bearing node for the remote test. Leave CPUs
-   online initially. A single-node host can run the local control only.
-3. Install the build dependencies on Ubuntu:
+## 1. Prepare a host
 
-   ```bash
-   sudo apt-get update
-   sudo apt-get install -y build-essential cmake git python3 pkg-config \
-     autoconf automake libtool wget unzip protobuf-compiler libprotobuf-dev \
-     libibverbs-dev librdmacm-dev libtbb-dev libjemalloc-dev libzmq3-dev \
-     libboost-all-dev libyaml-cpp-dev libspdlog-dev libpmemobj-dev libpmem-dev \
-     libnuma-dev libmemcached-dev libpapi-dev libssl-dev numactl pciutils
-   ```
-
-   The NUMA server requires C++17. Verbs development libraries are build
-   dependencies; this deployment does not need a Soft-RoCE device or VMs.
-   CMake downloads pinned dependencies, so first configuration needs network
-   access. Rebuild on the new host rather than copying binaries or CMake caches.
-4. From the repository root, build:
-
-   ```bash
-   make -C src/kvs/libbloom -j4
-   cmake -S . -B build/numa -DCMAKE_BUILD_TYPE=Release -DBUILD_NUMA_SERVER=ON
-   cmake --build build/numa --target dinomo-kvs-numa dinomo-numa-client-check dinomo-route -j4
-   ```
-
-### Re-establish correctness before benchmarking
-
-Run the following from the repository root, replacing **every CPU/node ID** as
-needed for the new host. The runner starts its own router, server, manager,
-and clients, creates a private pool, and saves generated configuration/logs.
-It requires the loopback DINOMO service ports to be free.
+Use an x86-64 Linux host. Two memory-bearing NUMA nodes are needed for a
+local/remote comparison; one node is enough for local correctness checks.
+Inspect topology and tmpfs capacity first:
 
 ```bash
-# Single-worker baseline, local pool, CPUs stay online.
+lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+numactl --hardware
+bash numa-test/numa_cpu_control.sh status
+df -h /dev/shm
+```
+
+Every CPU/node ID in this guide is an **example**. Replace them for your host.
+The benchmark examples assume distinct physical cores on compute node 0:
+workers `2,6,8,9`, manager `4`, router `0`, and clients `1,3`; pool node `0` is
+local and node `1` is remote. Check SMT sibling relationships using the CORE
+and SOCKET columns. The benchmark launcher rejects shared cores by default.
+Leave CPUs online for ordinary tests and benchmarks.
+
+Install the build dependencies on Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git python3 pkg-config \
+  autoconf automake libtool wget unzip protobuf-compiler libprotobuf-dev \
+  libibverbs-dev librdmacm-dev libtbb-dev libjemalloc-dev libzmq3-dev \
+  libboost-all-dev libyaml-cpp-dev libspdlog-dev libpmemobj-dev libpmem-dev \
+  libnuma-dev libmemcached-dev libpapi-dev libssl-dev numactl pciutils
+```
+
+These are the existing build dependencies; verbs libraries are needed to
+compile shared DINOMO sources even though NUMA runs do not open RDMA devices.
+The NUMA C++ targets use C++17. First-time CMake configuration downloads pinned
+dependencies and needs network access. Rebuild on a new machine rather than
+copying binaries or a CMake cache. Linux NUMA placement syscalls must be allowed;
+a restricted container may prevent placement checks or local socket creation.
+
+## 2. Build all NUMA components
+
+```bash
+# Small memory microbenchmarks.
+make -C numa-test -j4
+
+# Standalone DINOMO compute and reclamation tests.
+make -C numa-test/dinomo -j4
+make -C numa-test/dinomo build/dinomo-numa-gc-check -j4
+
+# Network server, router, correctness client, and benchmark client.
+make -C src/kvs/libbloom -j4
+cmake -S . -B build/numa -DCMAKE_BUILD_TYPE=Release -DBUILD_NUMA_SERVER=ON
+cmake --build build/numa --target \
+  dinomo-kvs-numa dinomo-route dinomo-numa-client-check dinomo-numa-bench -j4
+```
+
+`conf/dinomo-numa.yml` is the one-worker correctness baseline with synchronous
+deferred merge and reclamation. `conf/dinomo-numa-bench.json` is the separate
+benchmark template with quiet diagnostics. The Python runners generate private
+per-run configurations; do not edit the baseline for each experiment.
+
+## 3. Small memory experiments
+
+These measure the memory subsystem independently of DINOMO. They do not
+measure end-to-end GET/UPDATE latency. See the [memory experiment guide](../README.md)
+for placement policy, environment options, and result interpretation.
+
+| Runner | What it measures |
+|---|---|
+| `numa-test/run_experiment.sh` | Dependent pointer-chase latency, local versus remote, before and after pool-node CPU offlining |
+| `numa-test/run_memory_test.sh read-bandwidth` | Single-worker sequential read bandwidth |
+| `numa-test/run_memory_test.sh write-bandwidth` | Single-worker sequential write bandwidth |
+| `numa-test/run_memory_test.sh concurrent-read` | Aggregate random reads from multiple compute cores |
+| `numa-test/run_memory_test.sh atomic` | Random sequentially consistent 64-bit atomic fetch-add |
+| `numa-test/run_memory_test.sh mixed` | Concurrent 60% read / 30% write / 10% atomic workload |
+
+```bash
+HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 \
+  bash numa-test/run_experiment.sh
+HOST_NODE=0 MEMORY_NODE=1 SIZE_MB=256 DURATION=3 REPETITIONS=3 THREADS=8 \
+  bash numa-test/run_memory_test.sh all
+bash numa-test/show_results.sh
+bash numa-test/show_memory_results.sh
+```
+
+These runners use sudo to offline pool-node CPUs and restore them afterward.
+Use a working set larger than the host's last-level cache for memory-latency
+comparisons. Results go under `numa-test/results/`. `run_all_tests.sh` runs the
+memory suites; it does **not** run all DINOMO correctness and benchmark tests.
+
+## 4. DINOMO correctness tests, from smallest to largest
+
+Run network suites **one at a time**, with existing DINOMO services stopped and
+loopback service ports free. They share service ports. Each runner creates its
+own pool and saves evidence under `numa-test/dinomo/results/`.
+
+### Standalone compute and core reclamation
+
+```bash
+# Direct compute API: insert/read/update/read, missing keys, rollover,
+# repeated allocation batches, and sampled memory placement.
+HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=0 \
+  bash numa-test/dinomo/run_milestone.sh --no-offline
+
+# Same compute test against a remote pool, leaving CPUs online.
+HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 \
+  bash numa-test/dinomo/run_milestone.sh --no-offline
+
+# Mixed-live blocks, cold/colliding keys, and safe address reuse.
+HOST_CPU=2 MEMORY_NODE=0 bash numa-test/dinomo/run_gc_core_test.sh
+```
+
+The standalone milestone defaults to reclamation disabled and explicit merge
+boundaries. It exercises the real compute/P-CLHT code without network services.
+The core GC test adds the zero-reference/unleased reuse checks.
+
+### Network startup and single-worker visibility
+
+```bash
+# Startup, placement, and lifecycle only.
 python3 numa-test/dinomo/test_server_startup.py \
-  --host-cpu 2 --memory-node 0 --client-check --keys 64 \
+  --host-cpu 2 --manager-cpu 4 --memory-node 0
+
+# Add network value checks and deterministic deferred-merge visibility.
+python3 numa-test/dinomo/test_server_startup.py \
+  --host-cpu 2 --manager-cpu 4 --memory-node 0 --client-check --keys 64 \
   --merge-writes 16 --merge-ms 0 --require-deferred
 
-# Two-worker small-pool stress, no injected delays.
+# Reclamation stress in a 16 MiB pool.
+MEMORY_NODE=0 MANAGER_CPU=4 \
+  bash numa-test/dinomo/run_gc_test.sh --no-offline
+
+# Deferred merge plus reclamation stress; timer disabled for determinism.
+MEMORY_NODE=0 MANAGER_CPU=4 \
+  bash numa-test/dinomo/run_deferred_test.sh --no-offline
+```
+
+The correctness client checks immediate and later values, repeated updates,
+variable-size/binary values, missing keys, metadata, and cold keys. The deferred
+probe checks newest-value reads before merge across active logs and rollover.
+Stress checks require update bytes/log grants beyond pool capacity, bounded
+fresh allocation, actual reuse, and zero remaining leases/pending writes.
+
+### Concurrent merge, contention, and failure handling
+
+```bash
+# Ordinary concurrent operation, with no injected delays.
+MEMORY_NODE=0 MANAGER_CPU=4 CONCURRENT_MERGE=1 \
+  bash numa-test/dinomo/run_network_test.sh --no-offline
+
+# Stress overlap/reuse; deliberately injects a 5 ms writer-lock delay.
+MEMORY_NODE=0 MANAGER_CPU=4 \
+  bash numa-test/dinomo/run_concurrent_test.sh --no-offline
+
+# Force reader/writer contention and verify overlap.
+python3 numa-test/dinomo/test_server_startup.py \
+  --host-cpu 2 --manager-cpu 4 --memory-node 0 --client-check --keys 32 \
+  --merge-writes 16 --merge-ms 0 --require-deferred --concurrent \
+  --merge-start-delay-ms 20 --merge-lock-delay-ms 20 --reader-delay-ms 50 \
+  --require-overlap
+
+# Allocation-credit/control backpressure.
+MEMORY_NODE=0 MANAGER_CPU=4 MERGE_LOCK_DELAY_MS=50 REQUIRE_BACKPRESSURE=1 \
+  bash numa-test/dinomo/run_concurrent_test.sh --no-offline
+
+# Interrupt an active epoch; kill the owned manager during a reader wait.
+python3 numa-test/dinomo/test_concurrent_failure.py \
+  --host-cpu 2 --manager-cpu 4 --memory-node 0
+```
+
+Injected delays make contention and overlap observable. Keep all three delay
+hooks at zero for ordinary operation and performance measurements. Failure
+checks establish bounded failure and cleanup, not recovery of stored data.
+
+### Fixed-owner multiple workers
+
+```bash
+# Two-worker small-pool stress, without delay hooks.
 python3 numa-test/dinomo/test_server_startup.py \
   --workers 2 --worker-cpus 2,6 --host-cpu 2 --manager-cpu 4 \
   --memory-node 0 --concurrent --client-check --keys 32 --gc-rounds 256 \
   --pool-mb 16 --log-block-limit 96 --merge-ms 0
+
+# Four-worker local stress.
+python3 numa-test/dinomo/test_server_startup.py \
+  --workers 4 --worker-cpus 2,6,8,9 --host-cpu 2 --manager-cpu 4 \
+  --memory-node 0 --concurrent --client-check --keys 32 --gc-rounds 128 \
+  --pool-mb 16 --log-block-limit 192 --merge-ms 0
+
+# Multiworker interruption and manager-death checks.
+python3 numa-test/dinomo/test_concurrent_failure.py \
+  --workers 2 --worker-cpus 2,6 --host-cpu 2 --manager-cpu 4 --memory-node 0
 ```
 
-Repeat the second command with `--memory-node 1` for the remote pool. For a
-four-worker local run, use `--workers 4 --worker-cpus 2,6,8,10`,
-`--gc-rounds 128`, and `--log-block-limit 192`. Multiworker mode requires
-concurrent merge and fixed key ownership; caches, batching, and replication
-remain disabled. `conf/dinomo-numa.yml` intentionally defaults to one worker.
-The runner generates per-run overrides without editing that baseline file.
-The examples use stress-sized logs and pools, not benchmark sizing.
+Repeat with `--memory-node 1` to test remote placement while keeping CPUs
+online. The correctness runner starts one independent client keyspace per
+worker and checks affinity, all-worker readiness, publication, epoch drain,
+record counts, placement, and cleanup.
 
-Normal runs must pass client value checks, drain all epochs/pending writes,
-and leave zero leased blocks. The runner verifies pool placement, per-worker
-CPU affinity, process exit, and pool cleanup. See MULTIWORKER.md for contention
-and owned-process failure tests. Remote tests above keep pool-node CPUs online;
-CPU-offline memory-only validation is a separate workflow described below.
+## 5. Comparison and negative controls
 
-### Preserve the handoff and next task
+These are the existing comparison tests (there is no separate differential-test
+runner). Keep workload and placement matched while changing the named option.
 
-Evidence under `numa-test/dinomo/results/` is machine-local and ignored by Git.
-Copy the relevant evidence directories off an expiring node separately; a
-commit/push preserves source and documentation, not those logs. Each run saves
-the commit ID, Git status, generated config, topology, process/affinity data,
-and logs. Copy benchmark results separately as well once they exist. Pools
-are volatile and removed by the tests, so load data again for each fresh run.
+| Comparison | How to run | Expected evidence |
+|---|---|---|
+| Local versus remote pool | Repeat a Python test with `--memory-node 0` and `1`, or a shell test with `MEMORY_NODE=0/1 --no-offline` | Values remain correct; sampled pages are on the requested node |
+| Reclamation enabled versus disabled | Normal GC stress versus exhaustion command below | Reuse sustains updates; disabled reuse exhausts PMDK and cleans up |
+| Merge-before-ack versus deferred | `MERGE_WRITES=1 MERGE_MS=0` versus deferred runner | Both return correct values; deferred path also exercises unmerged reads |
+| Timer-only versus threshold-only | Timer command below versus deferred runner | Idle timer merge versus deterministic threshold merge |
+| Synchronous versus concurrent | Deferred runner versus concurrent runner | Correct values and safe reuse in both; concurrent epochs and overlap checked separately |
+| Timing enabled versus disabled | Benchmark default versus `--no-stall-timing` | Matched timing-overhead control; disabled run omits stall timing results |
+| CPUs online versus memory-only pool | Shell runner with versus without `--no-offline` | Correct placement and restoration of changed CPU state |
 
-The **next development task is benchmark integration**: adapt the existing
-LOAD → READ/UPDATE workflow to launch this host-native deployment. The older
-`vm-configs/c6525-25g/` launchers and `numa-test/run_dinomo_test.sh` still use
-the five-VM Soft-RoCE setup. Measure 1/2/4 workers with matched local/remote
-pool settings, sufficient client concurrency, and all delay hooks disabled.
-Report throughput, median/p99 latency, and index-lock/allocation/merge stalls.
-No performance improvement is established by the correctness stress results.
-Dynamic reassignment, replication, recovery, durability, and actual CXL
-hardware evaluation remain separate work.
+```bash
+# Negative control: real PMDK exhaustion, without an artificial block cap.
+MEMORY_NODE=0 RECLAIM_LOGS=0 LOG_BLOCK_LIMIT=0 EXPECT_EXHAUSTION=1 \
+  bash numa-test/dinomo/run_gc_test.sh --no-offline
 
-A NUMA-only `dinomo-numa-bench` client scaffold now provides bounded LOAD,
-READ, and UPDATE operations, synchronized starts, checked responses, and
-per-client latency histograms. [BENCHMARK_CLIENT.md](BENCHMARK_CLIENT.md)
-describes its smoke test and optional backend timing. The benchmark launcher
-and aggregate reporting are still pending; this does not establish performance.
+# Compatibility control: synchronous merge before each write acknowledgement.
+MEMORY_NODE=0 NUM_KEYS=32 MERGE_WRITES=1 MERGE_MS=0 \
+  bash numa-test/dinomo/run_network_test.sh --no-offline
 
-For a new chat, ask the agent to read this resume section and MULTIWORKER.md,
-inspect `git status`, and continue with benchmark integration. The sections
-below preserve the earlier single-worker milestones and their test procedures.
+# Timer-only merge, including a client-idle interval.
+MEMORY_NODE=0 NUM_KEYS=32 MERGE_WRITES=0 MERGE_MS=20 IDLE_MS=100 \
+  bash numa-test/dinomo/run_network_test.sh --no-offline
+```
 
-## Original standalone single-worker milestone
+The exhaustion control records `EXPECTED_EXHAUSTION`, not a successful workload
+PASS. At least one merge trigger must remain enabled in ordinary configurations.
 
-Run from this directory:
+For an explicit memory-only experiment, use a remote shell test **without**
+`--no-offline`, for example:
 
-~~~bash
-make -j4
-./run_milestone.sh
-~~~
+```bash
+HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 MANAGER_CPU=4 \
+  bash numa-test/dinomo/run_deferred_test.sh
+```
 
-The runner temporarily offlines all CPUs on node 1, checks that its online CPU
-list is empty, and runs a compute worker plus a storage manager on CPU 2 of
-node 0. Both processes map a private 256 MiB PMDK pool backed by tmpfs.
-The manager binds allocation to node 1 before creating/prefaulting the pool.
-All 256 sampled pool pages must be on node 1 before and after the test.
-CPU offlining requires sudo; the DINOMO processes run as the invoking user.
-CPUs changed by the run are restored on exit or interruption.
+This offlines pool-node CPUs using sudo and restores those changed by the run
+on exit/interruption. Use a pool node separate from compute; the CPU-control
+script protects the node containing CPU 0. After SIGKILL or a lost session,
+check status and restore if necessary:
 
-The test invokes the existing Dinomo template in
-include/kvs/dinomo_compute.hpp and the existing P-CLHT implementation.
-It verifies 1,000 inserts, post-merge reads, updates with a different value
-length, post-merge updated reads, a missing key, log rollover, and repeated
-allocation batches. Caches are disabled and each successful post-merge GET
-must increment the shared-pool read count.
-
-Evidence is saved under results/milestone-XXXXXXXX/:
-
-- topology.txt records CPU state, host CPU, pool node, and key count.
-- test.log records mapping addresses, placement checks, transfer counts,
-  allocation counts, and the final PASS or failure.
-
-The temporary PMDK pool is deleted after the test. It is a volatile correctness
-experiment; it provides no restart/recovery or power-loss durability guarantee.
-The existing RDMA pool at /dev/shm/pool is not used.
-
-## Dependencies
-
-Ubuntu packages:
-
-~~~bash
-sudo apt-get install build-essential libpmemobj-dev libibverbs-dev libtbb-dev
-~~~
-
-Verbs headers/library are required because the existing DINOMO source includes
-verbs types and inactive code paths. The milestone does not open an RDMA
-device, register memory, create queue pairs, or post verbs operations.
-
-## Local-memory control and debugging
-
-Run the same backend with a node 0 pool, leaving CPUs online:
-
-~~~bash
-MEMORY_NODE=0 ./run_milestone.sh --no-offline
-~~~
-
-Run a remote pool with all CPUs still online:
-
-~~~bash
-./run_milestone.sh --no-offline
-~~~
-
-Change the host CPU and workload size:
-
-~~~bash
-HOST_CPU=4 NUM_KEYS=5000 ./run_milestone.sh
-~~~
-
-The supported key-count range is 1 through 10,000. The default 4 KiB log blocks
-and allocation batches of two blocks intentionally force rollover at a small
-test size; these are test settings rather than performance settings.
-
-## Implementation boundary
-
-The standalone Makefile defines DINOMO_NUMA_MILESTONE. Existing Soft-RoCE build
-targets do not define it.
-
-- numa_backend.cpp is linked instead of ib.cpp. Blocking read/write helpers
-  translate storage addresses into checked offsets in the compute mapping and
-  copy bytes directly. Pool references keep the existing DINOMO format.
-- Allocation and explicit merge use synchronous Unix-domain IPC. PMDK allocation
-  and CLHT index updates execute in the storage manager on node 0.
-- The manager processes committed insert/update log records using the original
-  clht_put/clht_update. It does not run the original background merge/GC loop.
-- A NUMA-only post-merge cleanup retires active local staging so reads exercise
-  the shared index and updates begin a new log.
-- Different virtual addresses are supported by converting a storage address to
-  an offset before accessing the shared mapping.
-
-This milestone directly tests DINOMO's compute API. It does not yet start the
-network KVS server, routing, monitoring, or benchmark client. It supports one
-worker with explicit merge boundaries, insert/update/get, and synchronous
-allocation. Replication, failure handling, metadata operations, background GC,
-multiworker synchronization, and asynchronous completion paths need subsequent
-integration. Unsupported SEND paths fail explicitly.
-
-## Milestone 1: completed and validated
-
-The first functional milestone is complete at the compute-API level. It uses
-the existing DINOMO implementation rather than a replacement key-value store.
-
-| Component | Implemented behavior |
-|---|---|
-| Compute | One existing Dinomo instance, caches disabled, running on node 0 |
-| Storage manager | Separate process on node 0; owns PMDK allocation and explicit merge requests |
-| Pool | Private shared tmpfs-backed PMDK mapping allocated on the selected memory node |
-| Transfers | Blocking reads/writes copy through checked pool offsets; no RDMA device operations |
-| Index | Original P-CLHT lookup, insertion, and update implementation |
-| Control requests | Synchronous Unix-domain socket requests for allocation and merge |
-| Placement | 256 sampled pages checked before and after the operation test |
-| Lifecycle | Per-run pool creation/removal and restoration of CPUs changed by the runner |
-
-On the original c6420 host, the validated remote configuration used CPU 2 on
-node 0, all 32 logical CPUs on node 1 offline, and a 256 MiB pool on node 1.
-The 1,000-key test passed insert/read/update/read and missing-key checks,
-allocated 48 log blocks across repeated allocation requests, and verified
-256/256 sampled pages on node 1. Compute and storage mapped the pool at
-different virtual addresses. A node 0 pool control also passed.
-
-These are correctness results. The tiny log blocks, disabled caches, explicit
-merges, and synchronous IPC are not yet a configuration for performance claims.
-
-## Resume on a fresh CloudLab machine
-
-Clone the pushed branch and install the standalone milestone dependencies:
-
-~~~bash
-git clone --branch cloudlab-softroce https://github.com/Uriel-Segev/dinomo-cxl.git
-cd dinomo-cxl
-git log -1 --oneline
-sudo apt-get update
-sudo apt-get install -y build-essential libpmemobj-dev libibverbs-dev libtbb-dev
-lscpu
+```bash
 bash numa-test/numa_cpu_control.sh status
-df -h /dev/shm
-cd numa-test/dinomo
-make -j4
-~~~
+sudo bash numa-test/numa_cpu_control.sh restore
+```
 
-Select a host CPU that actually belongs to the chosen host node. The defaults
-assume CPU 2 belongs to node 0 and node 1 is the pool node. NUMA CPU numbering
-can differ on another server. The CPU-control script protects the node
-containing CPU 0, so use another node as the memory-only pool.
+## 6. Benchmark checks and measurements
 
-The runner requires at least 256 MiB of free tmpfs capacity plus overhead. It
-does not require KVM, VMs, a virtual bridge, or a Soft-RoCE device.
+First verify accounting, client behavior, and launcher lifecycle sequentially:
 
-Reproduce these configurations in order, substituting appropriate node and CPU
-IDs if necessary:
+```bash
+python3 numa-test/dinomo/test_benchmark_results.py
+python3 numa-test/dinomo/test_benchmark_client.py \
+  --worker-cpus 2 --manager-cpu 4 --client-cpu 6 --memory-node 0
+python3 numa-test/dinomo/test_benchmark_launcher.py \
+  --worker-cpu 2 --manager-cpu 4 --router-cpu 0 --client-cpus 1,3
+```
 
-~~~bash
-# Local pool control; all CPUs remain online.
-HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=0 ./run_milestone.sh --no-offline
+These cover weighted histogram quantiles, drain-tail retention, result identity
+and accounting, client values/errors/barriers, occupied ports, synchronous
+fallback with timing disabled, interruption, manager death, and cleanup.
 
-# Remote pool control; all CPUs remain online.
-HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 ./run_milestone.sh --no-offline
+Run the short 12-case workflow matrix:
 
-# Target configuration: remote pool with its CPUs offline during the test.
-HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 ./run_milestone.sh
+```bash
+python3 numa-test/dinomo/run_benchmark.py \
+  --worker-cpus 2,6,8,9 --worker-counts 1,2,4 \
+  --manager-cpu 4 --router-cpu 0 --client-cpus 1,3 \
+  --memory-nodes 0,1 --keys 1000 --value-size 64 \
+  --pool-mb 64 --log-block-bytes 4096 --outstanding 32 \
+  --warmup-s 1 --duration-s 2 --repeats 1
+```
 
-# Confirm CPU restoration afterward.
-../numa_cpu_control.sh status
-~~~
+The matrix measures READ and UPDATE separately with a fresh deployment and
+LOAD for each case. It verifies placement and affinity, warms up, synchronizes
+clients, measures, drains, verifies the full keyspace, and checks shutdown and
+cleanup. Every CPU stays online. The benchmark launcher requires workers,
+manager, router, and clients to use distinct online CPUs on the same compute
+node; workers use a prefix of `--worker-cpus` for each worker count.
 
-For each run, open the printed evidence directory and inspect topology.txt and
-test.log. Require a final PASS, correct page placement, and, for the target
-configuration, no online CPUs on the pool node in topology.txt. Preserve the
-commit ID alongside the evidence. The runner removes its temporary pool and
-restores CPUs after the run; the memory-only configuration is temporary.
+For longer measurements, use the command in [BENCHMARKING.md](BENCHMARKING.md):
+start with `--keys 10000 --pool-mb 512 --log-block-bytes 16384 --warmup-s 5
+--duration-s 30 --repeats 3`, keeping the other placement/workload options
+matched. Confirm `/dev/shm` capacity first. Vary client count and outstanding
+requests to check client saturation. Repeat with `--no-stall-timing` for an
+overhead control. A synchronous benchmark requires `--worker-counts 1
+--synchronous`. Dataset size alone does not determine pool capacity; leave
+space for live records, partially live blocks, index growth, and grants.
 
-If a previous run was interrupted and a saved CPU state remains, recover before
-starting another experiment:
+Throughput counts successful responses observed inside the scheduled window.
+Median/p99 are calculated from merged client histograms for **all requests
+issued in that window**, including drain completions. Percentiles are not
+averaged across clients or repeats. Backend allocation/merge/reader/writer
+wait times cover the whole server lifetime, including LOAD, warmup, VERIFY,
+and shutdown; categories can overlap and are not exclusive measured-phase
+stalls. See [BENCHMARK_CLIENT.md](BENCHMARK_CLIENT.md) for exact definitions.
 
-~~~bash
-sudo ../numa_cpu_control.sh restore
-../numa_cpu_control.sh status
-~~~
+## 7. Results, validation status, and moving hosts
 
-Compiled binaries, installed packages, and ignored results directories are not
-transferred by cloning. Copy results off the old machine if they are needed.
-The five-VM configuration in vm-configs/c6525-25g/config.sh is separate and
-contains host-specific SSH settings; it is not used by run_milestone.sh.
+| Evidence | Location/content |
+|---|---|
+| Memory microbenchmarks | `numa-test/results/`: CSV and summaries; use the display scripts |
+| Standalone/network correctness | `numa-test/dinomo/results/`: per-run logs, topology/configuration, and PASS/fault/exhaustion evidence as appropriate |
+| Benchmark matrix | `benchmark-*/summary.csv` and `summary.json`; one row per configuration/workload/repeat |
+| Individual benchmark case | `report.json`, phase/client results and histograms, configuration, process records, `cleanup.json`, PASS/FAIL |
+| Benchmark provenance | Root manifest, source/binary hashes, Git state/patch, source snapshots, topology, and available build metadata |
 
-## Milestone 2: one network KVS worker with a NUMA pool
+Implementation milestones have recorded standalone, network, reclamation,
+deferred, concurrent, and multiworker correctness results. Their detailed
+documents retain the historical evidence IDs and host-specific counts.
+The latest validation of the benchmark working tree passed all four build
+targets across the build checks, nine accounting tests, client integration,
+launcher failure/cleanup checks, and the 12-case 1/2/4-worker local/remote
+READ/UPDATE smoke matrix. The matrix evidence is
+`results/benchmark-bws7uyab/`; launcher evidence is
+`results/launcher-check-cgnw77tu/`; isolated client evidence is
+`results/benchmark-client-iq5cm3tg/`. These short runs validate the workflow. A subsequent longer evaluation
+completed 36 repeated baseline measurements and 10 client-concurrency/timing
+controls, all passing. See [BENCHMARK_EVALUATION.md](BENCHMARK_EVALUATION.md)
+for the results, evidence directories, and limits. Four-client UPDATE runs
+exceeded the two-client baseline substantially, so a matched scaling matrix
+with more client concurrency and measured-phase profiling remains next.
 
-The `dinomo-kvs-numa` target now serves the existing C++ `KvsClient` API
-through DINOMO's request handler, LWW serializer, wrapper, and compute engine.
-A host-native routing process provides membership discovery. Monitoring is
-not required for this bounded test with reporting and policies disabled.
-No VMs, Soft-RoCE device, or RDMA device operations are used.
+Result directories are ignored by Git and machine-local. Preserve selected
+logs/results separately before leaving a host. Commit/push source and docs,
+record the commit and working-tree state, rebuild on the next host, and rerun
+correctness checks before measuring. Pools are volatile and removed by the
+runners; every fresh deployment must load data again.
 
-The server runs one uncached, unbatched worker and a separate manager on the
-selected host CPU. Both access the private tmpfs-backed PMDK pool placed on the
-selected memory node. The existing RDMA target and standalone milestone remain
-available.
+The older `numa-test/run_dinomo_test.sh` and
+`vm-configs/c6525-25g/` scripts use the separate five-VM/Soft-RoCE workflow.
+They are not the host-native NUMA benchmark launcher.
 
-### Build and dependencies
+## Implementation and detailed documentation map
 
-In addition to the standalone milestone dependencies, the full server/client
-build needs CMake, Protobuf/compiler, jemalloc, Boost system/thread, and
-ZeroMQ/cppzmq, spdlog, and yaml-cpp. CMake downloads pinned vendor sources, so
-the first build requires network access.
+| File or guide | Purpose |
+|---|---|
+| `include/kvs/numa_backend.hpp`, `src/kvs/numa_backend.cpp` | Shared mapping, manager IPC, allocation, ownership/reuse, epochs, locks, placement, and counters |
+| `include/kvs/dinomo_compute.hpp` | NUMA compute integration, publication, staging visibility, merge/release |
+| `src/kvs/server.cpp` | NUMA worker startup, configuration, and lifecycle |
+| `src/benchmark/numa_client_check.cpp` | Network correctness workload |
+| `src/benchmark/numa_benchmark.cpp` | Host-native bounded benchmark client |
+| `numa-test/dinomo/run_benchmark.py`, `benchmark_results.py` | Deployment/matrix orchestration and result validation/aggregation |
+| [Memory experiments](../README.md) | Low-level latency/bandwidth/atomic tests and CPU control |
+| [Log reclamation](LOG_RECLAMATION.md) | Index references, leases, release handshake, reuse counters, exhaustion control |
+| [Deferred merge](DEFERRED_MERGE.md) | Latest-value reads, threshold/timer policy, rollover probes |
+| [Concurrent merge](CONCURRENT_MERGE.md) | Original single-worker epoch protocol, reader protection, backpressure, fault tests |
+| [Multiple workers](MULTIWORKER.md) | Current fixed-owner extension, constraints, stress/failure evidence |
+| [Benchmark client](BENCHMARK_CLIENT.md) | Client contract, histogram population, and timing definitions |
+| [Benchmark workflow](BENCHMARKING.md) | Full matrix setup, resource ownership, reports, interpretation |
+| [Longer benchmark evaluation](BENCHMARK_EVALUATION.md) | Repeated 1/2/4-worker results, client-concurrency/timing controls, and next experiments |
+| [Network integration audit](NETWORK_INTEGRATION_AUDIT.md) | Historical audit and integration findings |
 
-~~~bash
-cd ~/dinomo-cxl
-make -C src/kvs/libbloom -j4
-cmake -S . -B build/numa -DCMAKE_BUILD_TYPE=Release -DBUILD_NUMA_SERVER=ON
-cmake --build build/numa --target dinomo-kvs-numa dinomo-numa-client-check dinomo-route -j4
-~~~
-
-### Run network correctness
-
-The runner builds the targets, creates isolated configuration and logs, starts
-routing/server/client on the host CPU, checks results and placement, and
-removes its manager and temporary pool. By default it offlines the pool-node
-CPUs and restores those it changed on exit, failure, or interruption.
-
-~~~bash
-cd ~/dinomo-cxl
-
-# Local control: node 0 pool, all CPUs online.
-MEMORY_NODE=0 ./numa-test/dinomo/run_network_test.sh --no-offline
-
-# Target: node 1 pool, node 1 CPUs offline during the test.
-./numa-test/dinomo/run_network_test.sh
-
-# Confirm CPU restoration.
-./numa-test/numa_cpu_control.sh status
-~~~
-
-Defaults are `HOST_CPU=2 HOST_NODE=0 MEMORY_NODE=1 NUM_KEYS=256`.
-Adjust them to the machine's topology; `NUM_KEYS` supports 1..2000.
-Use `--no-offline` for a remote pool with its CPUs online.
-Run the script as the ordinary user; sudo is used for CPU hotplug.
-SIGKILL or power loss cannot run cleanup traps; use the existing CPU restore
-command if necessary.
-
-The C++ client checks:
-- Missing user and metadata keys.
-- Metadata PUT, GET, and UPDATE, including binary values.
-- Insert/read, update/read, and another update/read for every user key.
-- Changing value lengths and embedded NUL bytes.
-- Later reads of all keys after repeated allocation/merge cycles.
-
-The client never sends merge commands or clears worker staging. The server
-owns the visibility boundary. Startup tests also reject a multiworker
-configuration and check missing-router failure, SIGTERM exit, manager reaping,
-and private-pool removal. Evidence is saved under `results/server-startup-*`:
-configuration, topology, commit ID/working-tree status, and client/server/router
-logs. The final server log includes transfer, allocation, and metadata counters.
-
-For startup/lifecycle checks without the client or CPU hotplug:
-
-~~~bash
-python3 numa-test/dinomo/test_server_startup.py --host-cpu 2 --memory-node 1
-~~~
-
-### Visibility and metadata contract
-
-The first network milestone used merge-before-ack for every user write. The
-current NUMA server publishes each record before acknowledgement, reads the
-newest value from pending logs when necessary, and merges at a write threshold
-or timer (milestone 4 below). The triggering write may wait for merge; other
-writes need not. There is still no background merge or concurrent worker access.
-
-Metadata GET/PUT use bounded synchronous Unix-domain IPC to a volatile
-string-key store in manager-local memory, like the original storage metadata
-store. User records and the index reside in the selected shared pool.
-Metadata keys plus values must fit the 64 KiB IPC payload. User values, including
-their serialized LWW envelope, must fit one log block after its record header
-(the configuration uses 4 KiB total log blocks). Oversized requests fail
-explicitly. Missing results are handled before LWW deserialization.
-
-The NUMA server recycles unreferenced logs only after a complete merge and
-explicit compute release, as described in milestone 3 below. Merge/release
-remains synchronous even though acknowledgements can precede merge. This is
-not a performance configuration. The standalone baseline still tests
-capacity-driven rollover separately and defaults to reclamation disabled.
-
-### Validation on c8220
-
-The 256-key network test passed for:
-- A local node 0 pool with all CPUs online:
-  `results/server-startup-2_jmpy_5`.
-- A remote node 1 pool with all 20 node 1 logical CPUs offline:
-  `results/server-startup-9n624dqy`.
-
-These pre-reclamation baseline runs verified 256/256 sampled pool pages on the requested node at startup
-and shutdown. Each recorded 5,895 shared reads, 3,073 shared writes, 1,536
-allocated log blocks, four metadata GETs, and two metadata PUTs.
-The remote runner restored CPUs afterward. The standalone 1,000-key local
-milestone also passed after the IPC changes. These ignored evidence directories
-are machine-local and are not transferred by cloning.
-SIGTERM interruption during remote startup also passed pool removal and CPU
-restoration checks; evidence is in
-`results/server-startup-4f8x20fj/INTERRUPTION_PASS`.
-
-The initial source audit and implementation notes are in
-[NETWORK_INTEGRATION_AUDIT.md](NETWORK_INTEGRATION_AUDIT.md).
-
-## Milestone 3: synchronous single-worker log reclamation
-
-The manager now tracks index references and compute allocation leases.
-After merge, compute clears staging, caches, spare addresses, and its published
-log chain before explicitly releasing grants. Only zero-reference, unleased
-blocks can be reset and reused. This prevents reuse of a block that still
-holds a cold value or remains accessible through compute-local state.
-
-~~~bash
-cd ~/dinomo-cxl
-./numa-test/dinomo/run_gc_core_test.sh
-MEMORY_NODE=0 ./numa-test/dinomo/run_gc_test.sh --no-offline
-./numa-test/dinomo/run_gc_test.sh
-~~~
-
-The network stress passed with local and remote memory-only 16 MiB pools.
-It wrote about 20 MiB of update values and granted about 65 MiB of logical log
-space while fresh allocation stayed at 34 objects. The same workload with
-reuse disabled exhausted PMDK as expected. The original standalone milestone
-still passes. Remote pool CPUs were restored after testing.
-
-See [LOG_RECLAMATION.md](LOG_RECLAMATION.md) for ownership rules, exact counters,
-commands, the no-reclamation control, and saved evidence. This does not add
-continuous/background merge, multiple workers, partial-block compaction, or
-recovery.
-
-## Milestone 4: deferred merge with correct recent reads
-
-User writes now publish their log extent before acknowledgement. The server
-merges after 16 writes or 20 ms from the first pending write by default.
-Unmerged reads select the newest matching record in active staging or retained
-log copies, including after rollover. Merge remains worker-controlled and
-synchronous; the existing release handshake still protects reclamation.
-Normal shutdown drains outstanding writes.
-
-~~~bash
-cd ~/dinomo-cxl
-MEMORY_NODE=0 ./numa-test/dinomo/run_deferred_test.sh --no-offline
-./numa-test/dinomo/run_deferred_test.sh
-~~~
-
-These deterministic tests disable the timer and use a 16-write threshold. Local
-and remote memory-only runs passed 8,296 writes with 518 threshold merges and
-one shutdown drain. The 16 MiB pool handled about 20 MiB of update values with
-only 36 fresh log objects. Timer-only idle merge and merge-before-ack controls
-also passed. CPUs were restored after remote testing.
-
-See [DEFERRED_MERGE.md](DEFERRED_MERGE.md) for function flow, policy settings,
-test commands, counters, evidence, and the remaining concurrency limitations.
-
-## Milestone 5: concurrent sealed-log merge
-
-An opt-in mode lets the separate manager merge a sealed log batch while the
-compute worker accepts new writes and reads recent values from staging. Shared
-index reads hold a process-shared reader lock until the value is copied. An
-epoch-specific release handshake retires only the completed batch and preserves
-newer logs. Allocation credits provide bounded backpressure.
-
-~~~bash
-cd ~/dinomo-cxl
-MEMORY_NODE=0 MANAGER_CPU=4 ./numa-test/dinomo/run_concurrent_test.sh --no-offline
-MANAGER_CPU=4 ./numa-test/dinomo/run_concurrent_test.sh
-~~~
-
-Local and remote memory-only tests passed 8,296 writes and 518 asynchronous
-merges using a 16 MiB pool, with 38 fresh log objects. Reader contention,
-allocation backpressure, interruption, and manager failure were also tested.
-Remote pool CPUs were restored. The stress runner inserts a 5 ms merge delay to
-exercise overlap; ordinary configuration has no injected delays. These are
-correctness results, not performance measurements.
-
-Concurrent mode defaults to disabled, preserving the synchronous baseline.
-There is still one compute worker; shared-index reads and control/allocation
-requests can wait for the manager. See [CONCURRENT_MERGE.md](CONCURRENT_MERGE.md)
-for the protocol, configuration, commands, evidence, and limitations.
-
-## Fixed-owner multiworker extension
-
-An opt-in extension now supports multiple compute workers with private staging,
-control connections, and epochs against one pool and one manager. Two-worker
-local/remote pool stress and four-worker local pool stress have passed. See
-[MULTIWORKER.md](MULTIWORKER.md) for the ownership contract, run commands,
-validation evidence, and restrictions. The default remains one worker.
-
-## Later milestones
-
-1. Extend fixed-owner workers to support dynamic reassignment and cross-worker
-   consistency before enabling elasticity or failover.
-2. Refine the coarse index lock and allocation scheduling to reduce stalls
-   during concurrent maintenance. Consider compaction of partially live blocks
-   separately, preserving reader protection and epoch ownership.
-3. Integrate the existing benchmark client and report actual end-to-end GET
-   and UPDATE throughput plus median/p99 latency. The current run_dinomo_test.sh
-   still invokes the five-VM harness and must be adapted to select the new
-   host-native deployment before it can measure the NUMA server.
-4. Compare Soft-RoCE, a local shared pool, and a remote shared pool using matched
-   worker counts, cache settings, datasets, request mixes, and client placement.
-   Record cache hits and bytes/operations reaching the pool so cache behavior
-   does not conceal transport differences. Do not interpret microbenchmark
-   ns/op as client GET/UPDATE latency.
-5. Address replication, failure recovery, and persistence as separate features.
-   The current tmpfs pool is volatile, and remote NUMA access alone does not
-   establish actual CXL timing or persistent-memory durability semantics.
+Earlier milestone guides describe their scope at the time; use the current
+implementation overview above and MULTIWORKER.md for the cumulative feature
+boundary. Next work is repeated matched benchmark evaluation, followed by
+separately scoped improvements such as finer index locking, allocation
+scheduling, compaction, dynamic ownership, replication, and recovery.
